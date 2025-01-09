@@ -73,23 +73,48 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        available_experts: Optional[List[bool]] = None,  # New argument for availability
         **extra_weight_attrs,
     ):
-        # Fused gate_up_proj (column parallel)
+        # Default to all experts being available if not specified
+        if available_experts is None:
+            available_experts = [True] * num_experts
+
+        # Ensure `available_experts` matches the number of experts
+        assert len(available_experts) == num_experts, "Mismatch in number of experts"
+
+        # Create weights only for available experts
+        w13_weight_data = []
+        w2_weight_data = []
+
+        for expert_id, is_available in enumerate(available_experts):
+            if is_available:
+                # Initialize weights for the current expert
+                w13_weight_data.append(
+                    torch.empty(
+                        2 * intermediate_size, hidden_size, dtype=params_dtype
+                    )
+                )
+                w2_weight_data.append(
+                    torch.empty(
+                        hidden_size, intermediate_size, dtype=params_dtype
+                    )
+                )
+            else:
+                # Skip initializing weights for pruned experts
+                w13_weight_data.append(None)
+                w2_weight_data.append(None)
+
+        # Stack weights for available experts
         w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
-            ),
+            torch.stack([w for w in w13_weight_data if w is not None]),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts, hidden_size, intermediate_size, dtype=params_dtype
-            ),
+            torch.stack([w for w in w2_weight_data if w is not None]),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -131,7 +156,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        topk_weights, topk_ids = layer.select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -197,9 +222,11 @@ class FusedMoE(torch.nn.Module):
         tp_size: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
+        available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
-
+        # self.available_experts = available_experts or [True] * num_experts
+        self.available_experts = available_experts or [True] * 2 + [False] * (num_experts - 2) # temp: only 2 experts available
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -233,6 +260,7 @@ class FusedMoE(torch.nn.Module):
             intermediate_size=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            available_experts=self.available_experts,
         )
 
     def _load_per_tensor_weight_scale(
@@ -381,6 +409,10 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        
+        # skip loading if the weight is not available
+        if not self.available_experts[expert_id]:
+            return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
@@ -503,8 +535,8 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    @staticmethod
     def select_experts(
+        self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
@@ -545,7 +577,21 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize,
             )
+        # Adjust for pruned experts
+        topk_ids_adjusted = []
+        for token_idx, token_topk_ids in enumerate(topk_ids):
+            adjusted_ids = [
+                expert_id for expert_id in token_topk_ids if self.available_experts[expert_id]
+            ]
+            # If no available expert, fallback to the first available expert
+            if len(adjusted_ids) < top_k:
+                adjusted_ids += [
+                    idx for idx, available in enumerate(self.available_experts) if available
+                ][: top_k - len(adjusted_ids)]
+            topk_ids_adjusted.append(adjusted_ids)
 
+        topk_ids = torch.tensor(topk_ids_adjusted, device=router_logits.device)
+        print(f"topk_ids: {topk_ids}")
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
