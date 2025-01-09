@@ -49,7 +49,7 @@ from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
 from torch.library import Library
-from torch.profiler import ProfilerActivity, profile, record_function
+from torch.profiler import ProfilerActivity, profile, record_function, tensorboard_trace_handler
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -729,30 +729,56 @@ def broadcast_pyobj(
 step_counter = 0
 
 
+# def pytorch_profile(name, func, *args, data_size=-1):
+#     """
+#     Args:
+#         name (string): the name of recorded function.
+#         func: the function to be profiled.
+#         args: the arguments of the profiled function.
+#         data_size (int): some measurement of the computation complexity.
+#             Usually, it could be the batch size.
+#     """
+#     global step_counter
+#     os.makedirs("trace", exist_ok=True)
+#     with profile(
+#         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+#         # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+#         # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+#         record_shapes=True,
+#         profile_memory=True,
+#         with_stack=True,
+#     ) as prof:
+#         with record_function(name):
+#             with open(f"trace/size_{step_counter}.json", "w") as f:
+#                 json.dump({"size": data_size}, f)
+#             result = func(*args)
+#     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
+#     step_counter += 1
+#     return result
+
 def pytorch_profile(name, func, *args, data_size=-1):
     """
     Args:
-        name (string): the name of recorded function.
+        name (string): the name of the recorded function.
         func: the function to be profiled.
         args: the arguments of the profiled function.
         data_size (int): some measurement of the computation complexity.
             Usually, it could be the batch size.
     """
     global step_counter
-    os.makedirs("trace", exist_ok=True)
+    os.makedirs("tensorboard_logs", exist_ok=True)
+
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
+        on_trace_ready=tensorboard_trace_handler(f'./tensorboard_logs/run_{step_counter}')
     ) as prof:
         with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
             result = func(*args)
-    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
+    
+    # Increment the step counter
     step_counter += 1
     return result
 
