@@ -1375,7 +1375,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-range-ratio",
         type=float,
-        default=0.0,
+        default=1.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
     )

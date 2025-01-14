@@ -37,7 +37,7 @@ prompt_lib = [
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)
+    lines = list(read_jsonl(args.data_path))
 
     # Construct prompts
     # k = args.num_shot
@@ -45,7 +45,8 @@ def main(args):
 
     questions = []
     labels = []
-    for i in range(len(lines[: args.num_questions])):
+    #import pdb; pdb.set_trace()
+    for i in range(len(lines[:args.num_questions])):
         questions.append(lines[i]["question"])
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
