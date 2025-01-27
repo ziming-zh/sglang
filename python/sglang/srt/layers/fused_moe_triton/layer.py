@@ -119,6 +119,103 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+    
+    def update_experts(
+        self,
+        layer: torch.nn.Module,
+        expert_id: int,
+        operation: str,
+        w13_tensor: Optional[torch.Tensor] = None,
+        w2_tensor: Optional[torch.Tensor] = None,
+        available_experts: Optional[List[bool]] = None,
+    ):
+        """
+        Dynamically add or remove experts in the layer using available_experts for rebuilding.
+
+        Args:
+            layer (torch.nn.Module): The module containing expert weights.
+            expert_id (int): The ID of the expert to load or remove.
+            operation (str): Either "load" or "remove".
+            w13_tensor (torch.Tensor, optional): Tensor for w13_weight of the expert. Required for "load".
+            w2_tensor (torch.Tensor, optional): Tensor for w2_weight of the expert. Required for "load".
+            available_experts (List[bool], optional): A list indicating availability of experts.
+        """
+        assert operation in {"load", "remove"}, "Operation must be 'load' or 'remove'."
+        if not hasattr(layer, "w13_weight") or not hasattr(layer, "w2_weight"):
+            raise AttributeError(
+                "The layer does not have 'w13_weight' or 'w2_weight'. "
+                "Make sure to initialize weights using 'create_weights' first."
+            )
+
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        # Ensure available_experts matches the number of experts
+        if available_experts is None:
+            raise ValueError("available_experts list must be provided.")
+        current_experts = len(available_experts)
+        assert available_experts.count(True) == len(w13_weight), f"Mismatch in number of available experts and weights length. Available experts: {available_experts}, w13_weight length: {len(w13_weight)}"
+
+        if operation == "load":
+            assert w13_tensor is not None and w2_tensor is not None, \
+                "For 'load' operation, w13_tensor and w2_tensor must be provided."
+            assert w13_tensor.size() == (2 * layer.intermediate_size_per_partition, layer.hidden_size), \
+                "w13_tensor size mismatch."
+            assert w2_tensor.size() == (layer.hidden_size, layer.intermediate_size_per_partition), \
+                "w2_tensor size mismatch."
+                
+            # make sure tensor are on the same device and the same dtype as the weights
+            w13_tensor = w13_tensor.to(dtype=w13_weight.dtype, device=w13_weight.device)
+            w2_tensor = w2_tensor.to(dtype=w2_weight.dtype, device=w2_weight.device)
+            
+            in_place_update = False
+            if available_experts[expert_id]:
+                in_place_update = True
+            
+            # Update the available_experts list and weights
+            if expert_id >= current_experts:
+                # Extend the available_experts list if expert_id is beyond current range
+                available_experts.extend([False] * (expert_id - current_experts + 1))
+            available_experts[expert_id] = True
+
+            # Update weights dynamically
+            if in_place_update:
+                w13_weight_data = [w13_tensor if idx == expert_id else w for idx, w in enumerate(w13_weight)]
+                w2_weight_data = [w2_tensor if idx == expert_id else w for idx, w in enumerate(w2_weight)]
+            else:
+                # do insert
+                w13_weight_data = [w for idx, w in enumerate(w13_weight)]
+                w13_weight_data.insert(expert_id, w13_tensor)
+                w2_weight_data = [w for idx, w in enumerate(w2_weight)]
+                w2_weight_data.insert(expert_id, w2_tensor)
+
+        elif operation == "remove":
+            assert expert_id < current_experts, f"Expert {expert_id} does not exist."
+            assert available_experts[expert_id], f"Expert {expert_id} is already removed."
+            
+            # Mark the expert as unavailable
+            available_experts[expert_id] = False
+
+            # Set weights to None for the removed expert
+            w13_weight_data = [None if idx == expert_id else w for idx, w in enumerate(w13_weight)]
+            w2_weight_data = [None if idx == expert_id else w for idx, w in enumerate(w2_weight)]
+
+        # Rebuild the weights based on available_experts
+        w13_weight = torch.nn.Parameter(
+            torch.stack([w for w, available in zip(w13_weight_data, available_experts) if available]),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.stack([w for w, available in zip(w2_weight_data, available_experts) if available]),
+            requires_grad=False,
+        )
+
+        # Update layer parameters
+        layer.w13_weight = w13_weight
+        layer.w2_weight = w2_weight
+        layer.register_parameter("w13_weight", layer.w13_weight)
+        layer.register_parameter("w2_weight", layer.w2_weight)
+
 
     def apply(
         self,
@@ -226,7 +323,7 @@ class FusedMoE(torch.nn.Module):
     ):
         super().__init__()
         # self.available_experts = available_experts or [True] * num_experts
-        self.available_experts = available_experts or [True] * 2 + [False] * (num_experts - 2) # temp: only 2 experts available
+        self.available_experts = available_experts or [True] * 4 + [False] * (num_experts - 4) # temp: only 4 experts available
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -236,6 +333,7 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.num_experts = num_experts
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.hidden_size = hidden_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
@@ -262,6 +360,7 @@ class FusedMoE(torch.nn.Module):
             weight_loader=self.weight_loader,
             available_experts=self.available_experts,
         )
+
 
     def _load_per_tensor_weight_scale(
         self,
@@ -534,7 +633,46 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
             return
+    def swap_experts(
+        self,
+        src_gpu: int,
+        dst_gpu: int,
+        expert_id: int,
+    ):
+        """
+        Swap expert weights between GPUs using NCCL.
 
+        Args:
+            src_gpu (int): Source GPU ID.
+            dst_gpu (int): Destination GPU ID.
+            expert_id (int): ID of the expert to swap.
+        """
+        # Ensure NCCL is initialized
+        if not dist.is_initialized():
+            raise RuntimeError("Distributed environment not initialized.")
+
+        # Get the expert weights
+        expert_weights_src = {
+            "w13": self.w13_weight[expert_id].to(src_gpu),
+            "w2": self.w2_weight[expert_id].to(src_gpu),
+        }
+
+        # Create placeholder tensors on the destination GPU
+        expert_weights_dst = {
+            "w13": torch.empty_like(expert_weights_src["w13"], device=dst_gpu),
+            "w2": torch.empty_like(expert_weights_src["w2"], device=dst_gpu),
+        }
+
+        # Use NCCL to transfer weights
+        dist.broadcast(expert_weights_src["w13"], src=src_gpu, group=dist.group.WORLD)
+        dist.broadcast(expert_weights_src["w2"], src=src_gpu, group=dist.group.WORLD)
+
+        # Update weights on the destination GPU
+        self.w13_weight[expert_id].data = expert_weights_dst["w13"]
+        self.w2_weight[expert_id].data = expert_weights_dst["w2"]
+
+        # Update availability status
+        self.available_experts[expert_id] = True
     def select_experts(
         self,
         hidden_states: torch.Tensor,
@@ -597,10 +735,50 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        # Matrix multiply.
+        # Create CUDA streams for asynchronous operations
+        stream = torch.cuda.Stream(device=hidden_states.device)
+
+        # Define the portion of rows to exchange (e.g., first 10% of rows)
+        num_rows = hidden_states.size(0)
+        rows_to_exchange = num_rows // 10  # Adjust the portion as needed
+
+        # Split `hidden_states` into parts to send and keep
+        hidden_to_send = hidden_states[:rows_to_exchange]
+        hidden_to_keep = hidden_states[rows_to_exchange:]
+
+        # Prepare a tensor to store received rows from the other GPU
+        received_hidden = torch.zeros_like(hidden_to_send, device=hidden_states.device)
+
+        # Use torch.distributed.all_to_all to exchange rows between GPUs
+        with torch.cuda.stream(stream):
+            # Perform the all-to-all communication
+            torch.distributed.all_to_all_single(
+                received_hidden,
+                hidden_to_send
+            )
+            
+        
+
+        # Synchronize the stream to ensure communication is complete
+        stream.synchronize()
+        
+        very_large_tensor_to_send = torch.randn(80000000//1000, device=hidden_states.device)
+        very_large_tensor_to_receive = torch.zeros_like(very_large_tensor_to_send)
+        with torch.cuda.stream(stream):
+            torch.distributed.all_to_all_single(
+                very_large_tensor_to_receive,
+                very_large_tensor_to_send
+            )
+        stream.synchronize()
+        
+
+        # Recombine the received rows with the remaining `hidden_states`
+        exchanged_hidden_states = torch.cat([received_hidden, hidden_to_keep], dim=0)
+
+        # Perform the quantized matrix multiply on the exchanged hidden states
         final_hidden_states = self.quant_method.apply(
             layer=self,
-            x=hidden_states,
+            x=exchanged_hidden_states,
             router_logits=router_logits,
             top_k=self.top_k,
             renormalize=self.renormalize,
@@ -610,10 +788,12 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
         )
 
+        # Perform a tensor parallel all-reduce if necessary
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
 
     @classmethod
     def make_expert_params_mapping(

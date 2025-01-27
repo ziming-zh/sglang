@@ -92,8 +92,18 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
-
+        self.swap_experts=True
+       
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if(self.swap_experts==True):
+            print("[Testing]Swapping experts")
+            import time
+            start = time.time()
+            self.experts.quant_method.update_experts(self.experts, 1, "remove", available_experts=self.experts.available_experts)
+            self.experts.quant_method.update_experts(self.experts, 1, "load", torch.randn(2 * self.experts.intermediate_size_per_partition, self.hidden_size), torch.randn(self.hidden_size, self.experts.intermediate_size_per_partition), available_experts=self.experts.available_experts)
+            end = time.time()
+            print(f"[Testing]Swapping experts took {end-start} seconds")
+            self.swap_experts=False
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
