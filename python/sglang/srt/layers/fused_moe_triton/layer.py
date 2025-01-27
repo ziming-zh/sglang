@@ -729,7 +729,7 @@ class FusedMoE(torch.nn.Module):
             topk_ids_adjusted.append(adjusted_ids)
 
         topk_ids = torch.tensor(topk_ids_adjusted, device=router_logits.device)
-        print(f"topk_ids: {topk_ids}")
+        # print(f"topk_ids: {topk_ids}")
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):

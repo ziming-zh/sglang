@@ -109,9 +109,21 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        ### TODO: Add seperate logic here
+        ### Tokens with local experts found should be kept (token_hit)
+        ### Tokens without local experts found should be routed to other MoE instance (token_miss / sent to the dispatch_buffer)
+        ### assert that there should be no miss during the prefilling phase
+        
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            
+        ### TODO: Add collect logic here
+        ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
+        ### assert that there should be nothing to collect during the prefilling phase
+        
+        
         return final_hidden_states.view(orig_shape)
 
 
@@ -247,6 +259,9 @@ class MixtralDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        
+        ### TODO: Add speculation logit here
+        # hidden_states = self.speculation_logit(hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
