@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import triton
@@ -148,7 +148,132 @@ class ForwardBatch:
     global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+    
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
+    def split(self, mask: torch.Tensor) -> Tuple["ForwardBatch", "ForwardBatch"]:
+        """
+        Splits the ForwardBatch into local and remote batches based on a binary mask.
+        
+        Args:
+            mask (torch.Tensor): A binary tensor where 1 indicates local and 0 indicates remote.
+
+        Returns:
+            Tuple[ForwardBatch, ForwardBatch]: The local and remote batches.
+        """
+        assert mask.shape == self.input_ids.shape, "Mask shape must match input_ids shape"
+
+        remote_mask = mask.bool()
+        local_mask = ~remote_mask
+
+        def split_tensor(tensor: Optional[torch.Tensor]):
+            return (tensor[local_mask].clone() if tensor is not None else None,
+                    tensor[remote_mask].clone() if tensor is not None else None)
+
+        def split_list(lst: Optional[List]):
+            return ([lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None,
+                    [lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None)
+
+
+        
+        local_batch = ForwardBatch()
+        remote_batch = ForwardBatch()
+        
+        local_batch.forward_mode = self.forward_mode
+        remote_batch.forward_mode = self.forward_mode
+
+        # Split core tensors
+        local_batch.input_ids, remote_batch.input_ids = split_tensor(self.input_ids)
+        local_batch.seq_lens = local_mask.sum(dim=-1)
+        remote_batch.seq_lens = remote_mask.sum(dim=-1)
+        
+        local_batch.seq_lens_sum = local_batch.seq_lens.sum().item()
+        remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item()
+        
+        local_batch.positions, remote_batch.positions = split_tensor(self.positions)
+        local_batch.out_cache_loc, remote_batch.out_cache_loc = split_tensor(self.out_cache_loc)
+
+        # Split other metadata
+        local_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
+        remote_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
+        # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
+        # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
+        local_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
+        remote_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
+        
+        # Copy attention backend
+        local_batch.req_to_token_pool = self.req_to_token_pool
+        remote_batch.req_to_token_pool = self.req_to_token_pool
+        local_batch.token_to_kv_pool = self.token_to_kv_pool
+        remote_batch.token_to_kv_pool = self.token_to_kv_pool
+        local_batch.attn_backend = self.attn_backend
+        remote_batch.attn_backend = self.attn_backend
+        
+
+        # Compute new batch sizes
+        local_batch.batch_size = local_batch.input_ids.shape[0] if local_batch.input_ids is not None else 0
+        remote_batch.batch_size = remote_batch.input_ids.shape[0] if remote_batch.input_ids is not None else 0
+
+        return local_batch, remote_batch
+
+    def combine(self, other: "ForwardBatch") -> "ForwardBatch":
+        """
+        Combines the current ForwardBatch with another ForwardBatch.
+
+        Args:
+            other (ForwardBatch): Another ForwardBatch to merge with.
+
+        Returns:
+            ForwardBatch: A new merged ForwardBatch.
+        """
+        assert isinstance(other, ForwardBatch), "Other batch must be an instance of ForwardBatch"
+
+        merged_batch = ForwardBatch()
+
+        def concat_tensor(t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]):
+            if t1 is not None and t2 is not None:
+                if t1.dim() == 0:
+                    return t2
+                if t2.dim() == 0:
+                    return t1
+                return torch.cat([t1, t2], dim=-1)
+            return t1 or t2
+
+        def concat_list(l1: Optional[List], l2: Optional[List]):
+            return (l1 or []) + (l2 or []) if l1 is not None or l2 is not None else None
+        
+        # Merge forward mode
+        merged_batch.forward_mode = self.forward_mode
+
+        # Merge core tensors
+        merged_batch.input_ids = concat_tensor(self.input_ids, other.input_ids)
+        merged_batch.seq_lens = concat_tensor(self.seq_lens, other.seq_lens)
+        
+        merged_batch.seq_lens_sum = self.seq_lens_sum + other.seq_lens_sum
+        merged_batch.positions = concat_tensor(self.positions, other.positions)
+        merged_batch.out_cache_loc = concat_tensor(self.out_cache_loc, other.out_cache_loc)
+
+        # Merge other metadata
+        merged_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
+        
+        # merged_batch.image_inputs = concat_list(self.image_inputs, other.image_inputs)
+        # merged_batch.lora_paths = concat_list(self.lora_paths, other.lora_paths)
+        merged_batch.sampling_info = self.sampling_info or other.sampling_info
+
+        # Compute new batch size
+        merged_batch.batch_size = (self.batch_size or 0) + (other.batch_size or 0)
+        
+        # Copy attention backend
+        merged_batch.req_to_token_pool = self.req_to_token_pool.combine(other.req_to_token_pool)
+        merged_batch.token_to_kv_pool = self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)
+        merged_batch.attn_backend = other.attn_backend
+        
+
+        return merged_batch
+
+    
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):

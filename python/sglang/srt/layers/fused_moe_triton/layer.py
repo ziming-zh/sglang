@@ -12,6 +12,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.custom_op import CustomOp
 
+from python.sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -235,6 +236,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool,
+        is_decode_mode: bool,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
@@ -249,6 +253,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            is_decode_mode=is_decode_mode,
+            residual=residual,
+            forward_batch=forward_batch,
         )
 
     def forward_cuda(
@@ -259,6 +266,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         top_k: int,
         router_logits: torch.Tensor,
         renormalize: bool,
+        is_decode_mode: bool,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
@@ -272,44 +282,100 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            is_decode_mode=is_decode_mode,
         )
-        
+
         x_remote = x[is_remote_toks]
         x_local = x[~is_remote_toks]
         print(f"x_remote: {x_remote.shape}, x_local: {x_local.shape}")
-        
+
         topk_weights_remote = topk_weights[is_remote_toks]
         topk_ids_remote = topk_ids[is_remote_toks]
-        
+
         topk_weights_local = topk_weights[~is_remote_toks]
         topk_ids_local = topk_ids[~is_remote_toks]
         
-        # Async Offload to CPU and Compute on CPU
-        if x_remote.numel() > 0:
+        forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
+        
+        # print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}")
+        
+        if residual is not None:
+            residual_remote = residual[is_remote_toks]
+            residual_local = residual[~is_remote_toks]
+        else:
+            residual_remote = None
+            residual_local = None
+
+        # Buffer x_remote to avoid small CPU offloads
+        if not hasattr(self, "remote_forward_batch") or self.remote_forward_batch is None:
+            self.remote_buffer = [(x_remote, topk_weights_remote, topk_ids_remote, residual_remote)]
+            self.remote_forward_batch = forward_batch_remote
+
+        elif x_remote.numel() > 0:
+            self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
+            self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
+
+        # Only offload when buffer size is 20 or more
+        if len(self.remote_buffer) >= 1:
+            print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU")
             with torch.cuda.stream(self.stream_cpu):
-                x_remote_cpu = x_remote.to("cpu", non_blocking=True)
+                # Concatenate buffered tensors before offloading
+                x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu", non_blocking=True)
+                topk_weights_remote_cpu = torch.cat([item[1] for item in self.remote_buffer], dim=0)
+                topk_ids_remote_cpu = torch.cat([item[2] for item in self.remote_buffer], dim=0)
+                if residual_remote is not None:
+                    residual_remote_cpu = torch.cat([item[3] for item in self.remote_buffer], dim=0)
+                else:
+                    residual_remote_cpu = None
+
                 w13_cpu = self.w13_cpu
                 w2_cpu = self.w2_cpu
-               
-                self.cpu_buffer[x_remote.data_ptr()] = fused_experts_cpu_impl(
+                
+                # print(f"x_remote_cpu: {x_remote_cpu.shape}, topk_weights_remote_cpu: {topk_weights_remote_cpu.shape}, topk_ids_remote_cpu: {topk_ids_remote_cpu.shape}")
+
+                # Process in CPU
+                cpu_result = fused_experts_cpu_impl(
                     hidden_states=x_remote_cpu,
                     w13=w13_cpu,
                     w2=w2_cpu,
-                    topk_weights=topk_weights_remote,
-                    topk_ids=topk_ids_remote,
+                    topk_weights=topk_weights_remote_cpu,
+                    topk_ids=topk_ids_remote_cpu,
+                    residual=residual_remote_cpu,
                 )
-        
+
+                # Store CPU results mapped to the original x_remote data pointers
+                self.cpu_buffer[x_remote_cpu.data_ptr()] = cpu_result, residual_remote_cpu, forward_batch_remote
+
+            # Clear buffer after offloading
+            self.remote_buffer.clear()
+            # remove the self.remote_forward_batch attribute
+            self.remote_forward_batch=None
+            
+
         # Check for completed CPU computations and move back to GPU
         fetched_cpu_results = []
+        fetched_residuals = []
+        fetched_forward_batch = []
         for key, cpu_result in list(self.cpu_buffer.items()):
             with torch.cuda.stream(self.stream_gpu):
-                gpu_result = cpu_result.to("cuda", non_blocking=True)
+                gpu_result = cpu_result[0].to("cuda", non_blocking=True)
+                residual_gpu = cpu_result[1].to("cuda", non_blocking=True)
+                forward_batch_remote = cpu_result[2]
                 fetched_cpu_results.append(gpu_result)
+                fetched_residuals.append(residual_gpu)
+
+                if not isinstance(forward_batch_remote, ForwardBatch):
+                    fetched_forward_batch = forward_batch_remote
+                else:
+                    fetched_forward_batch.combine(forward_batch_remote)
                 del self.cpu_buffer[key]
-        
+
         if fetched_cpu_results:
             x_local = torch.cat([x_local] + fetched_cpu_results, dim=0)
-        
+            if residual_local is not None:
+                residual_local = torch.cat([residual_local] + fetched_residuals, dim=0)
+            forward_batch_local.combine(fetched_forward_batch)
+
         return fused_experts(
             hidden_states=x_local,
             w1=layer.w13_weight,
@@ -317,7 +383,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_weights=topk_weights_local,
             topk_ids=topk_ids_local,
             inplace=True,
-        )
+        ), residual_local, forward_batch_local
 
     def forward_cpu(self, *args, **kwargs):
         raise NotImplementedError("The CPU backend currently does not support MoE.")
@@ -807,6 +873,7 @@ class FusedMoE(torch.nn.Module):
         top_k: int,
         use_grouped_topk: bool,
         renormalize: bool,
+        is_decode_mode: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
@@ -834,6 +901,7 @@ class FusedMoE(torch.nn.Module):
                 gating_output=router_logits,
                 topk=top_k,
                 renormalize=renormalize,
+                is_decode_mode=is_decode_mode,
             )
         else:
             topk_weights, topk_ids = custom_routing_function(
@@ -869,7 +937,7 @@ class FusedMoE(torch.nn.Module):
         # print(f"topk_ids: {topk_ids}")
         return topk_weights, topk_ids, is_remote
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch):
         assert self.quant_method is not None
         
         exchanged_hidden_states = hidden_states
@@ -926,7 +994,7 @@ class FusedMoE(torch.nn.Module):
 
 
         # Perform the quantized matrix multiply on the exchanged hidden states
-        final_hidden_states = self.quant_method.apply(
+        final_hidden_states, residual, forward_batch = self.quant_method.apply(
             layer=self,
             x=exchanged_hidden_states,
             router_logits=router_logits,
@@ -936,13 +1004,16 @@ class FusedMoE(torch.nn.Module):
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
+            is_decode_mode=is_decode_mode,
+            residual=residual,
+            forward_batch=forward_batch,
         )
 
         # Perform a tensor parallel all-reduce if necessary
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states
+        return final_hidden_states, residual, forward_batch
 
 
     @classmethod

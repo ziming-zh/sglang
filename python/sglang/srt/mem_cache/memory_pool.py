@@ -91,6 +91,39 @@ class ReqToTokenPool:
     def apply_write_records(self, write_records: List[Tuple]):
         for indices, values in write_records:
             self.req_to_token[indices] = values
+            
+    def combine(self, other: "ReqToTokenPool") -> None:
+        """
+        Combines another ReqToTokenPool into the current one (in-place modification).
+
+        Args:
+            other (ReqToTokenPool): Another ReqToTokenPool instance.
+        """
+        assert isinstance(other, ReqToTokenPool), "Other pool must be an instance of ReqToTokenPool."
+        assert self.max_context_len == other.max_context_len, "max_context_len must match."
+        assert self.device == other.device, "Both pools must be on the same device."
+
+        # Compute new total size
+        old_size = self.size
+        new_size = self.size + other.size
+
+        # Resize req_to_token tensor to accommodate new data
+        new_req_to_token = torch.zeros(
+            (new_size, self.max_context_len), dtype=torch.int32, device=self.device
+        )
+        new_req_to_token[:old_size] = self.req_to_token  # Copy old data
+        new_req_to_token[old_size:] = other.req_to_token  # Copy new data
+
+        # Update self attributes in place
+        self.size = new_size
+        self.req_to_token = new_req_to_token  # Replace with the resized tensor
+
+        # Merge free slots with adjusted indices
+        self.free_slots.extend(i + old_size for i in other.free_slots)
+
+        # Merge write records if enabled
+        if self.use_records:
+            self.write_records.extend((indices + old_size, values) for indices, values in other.write_records)
 
 
 class BaseTokenToKVPool:
@@ -166,6 +199,9 @@ class BaseTokenToKVPool:
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
+    
+    def migrate_kv_buffer(self, source_kv_pool: "BaseTokenToKVPool") -> None:
+        raise NotImplementedError()
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
@@ -220,6 +256,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        # print("set_kv_buffer")
+        # print(f"layer: {layer}")
+        # print(f"loc: {loc}")
+        # print(f"cache_k's shape: {cache_k.shape}")
+        # print(f"cache_v's shape: {cache_v.shape}")
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -231,6 +272,39 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v
 
+    def migrate_kv_buffer(self, source_kv_pool: "MHATokenToKVPool"):
+        """
+        Migrate the KV buffer from another MHATokenToKVPool to the current one.
+
+        Args:
+            source_kv_pool (MHATokenToKVPool): The source KV pool to migrate from.
+
+        Raises:
+            ValueError: If the source and target KV pools are incompatible.
+        """
+        # Validate pool compatibility
+        if len(self.k_buffer) != len(source_kv_pool.k_buffer):
+            raise ValueError("Mismatch in layer count between KV pools.")
+        if self.k_buffer[0].shape[1:] != source_kv_pool.k_buffer[0].shape[1:]:
+            raise ValueError("Head number and head dimension mismatch between KV pools.")
+        if self.store_dtype != source_kv_pool.store_dtype:
+            print(f"Warning: store_dtype mismatch. Converting from {source_kv_pool.store_dtype} to {self.store_dtype}")
+
+        # Migrate KV cache
+        for layer_id in range(len(self.k_buffer)):
+            # Convert dtype if necessary
+            source_k = source_kv_pool.k_buffer[layer_id]
+            source_v = source_kv_pool.v_buffer[layer_id]
+
+            if source_k.dtype != self.store_dtype:
+                source_k = source_k.to(self.store_dtype)
+                source_v = source_v.to(self.store_dtype)
+
+            # Copy data
+            self.k_buffer[layer_id].copy_(source_k)
+            self.v_buffer[layer_id].copy_(source_v)
+
+        print("KV cache migration completed successfully.")
 
 # This compiled version is slower in the unit test
 # python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size

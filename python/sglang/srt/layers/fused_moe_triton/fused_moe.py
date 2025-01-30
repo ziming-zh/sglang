@@ -401,6 +401,7 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    is_decode_mode: bool,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -421,6 +422,20 @@ def fused_topk(
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
     del token_expert_indicies  # Not used. Will be used in the future.
+    
+        # Find indices where topk_ids == 4
+    mask_4 = topk_ids >= 4
+    if is_decode_mode:
+
+        # Randomly select 3/4 of these indices to change to 3
+        num_to_change = int(mask_4.sum() * 19 / 20)  # Compute 3/4 of occurrences of 4
+        indices_to_change = mask_4.nonzero(as_tuple=True)  # Get index positions
+
+        if num_to_change > 0:
+            selected_indices = torch.randperm(len(indices_to_change[0]))[:num_to_change]  # Random selection
+            topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] -= 4
+    else:
+        topk_ids[mask_4] -= 4
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
