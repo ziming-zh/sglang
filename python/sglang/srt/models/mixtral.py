@@ -92,8 +92,18 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.swap_experts=True
+       
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch):
+        if(self.swap_experts==True):
+            print("[Testing]Swapping experts")
+            import time
+            start = time.time()
+            self.experts.quant_method.update_experts(self.experts, 1, "remove", available_experts=self.experts.available_experts)
+            self.experts.quant_method.update_experts(self.experts, 1, "load", torch.randn(2 * self.experts.intermediate_size_per_partition, self.hidden_size), torch.randn(self.hidden_size, self.experts.intermediate_size_per_partition), available_experts=self.experts.available_experts)
+            end = time.time()
+            print(f"[Testing]Swapping experts took {end-start} seconds")
+            self.swap_experts=False
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
@@ -105,7 +115,10 @@ class MixtralMoE(nn.Module):
         ### Tokens without local experts found should be routed to other MoE instance (token_miss / sent to the dispatch_buffer)
         ### assert that there should be no miss during the prefilling phase
         
-        final_hidden_states = self.experts(hidden_states, router_logits)
+        available_experts = self.experts.available_experts
+        
+        
+        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
             
@@ -114,7 +127,7 @@ class MixtralMoE(nn.Module):
         ### assert that there should be nothing to collect during the prefilling phase
         
         
-        return final_hidden_states.view(orig_shape)
+        return final_hidden_states.view(-1, *orig_shape[1:]), residual, forward_batch
 
 
 class MixtralAttention(nn.Module):
@@ -237,12 +250,18 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ):
         # Self Attention
+        # quit if hidden_states and residual are empty
+        if hidden_states.numel() == 0 and residual.numel() == 0:
+            return hidden_states, residual, forward_batch
+        
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            print(f"[Testing]Residual shape: {residual.shape}")
+            print(f"[Testing]Hidden states shape: {hidden_states.shape}")
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
@@ -252,11 +271,13 @@ class MixtralDecoderLayer(nn.Module):
         
         ### TODO: Add speculation logit here
         # hidden_states = self.speculation_logit(hidden_states)
+        
+        is_decode_mode = forward_batch.forward_mode.is_decode()
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
-        return hidden_states, residual
+        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
+        return hidden_states, residual, forward_batch
 
 
 class MixtralModel(nn.Module):
@@ -298,10 +319,11 @@ class MixtralModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states, residual, forward_batch = layer(
                 positions, hidden_states, forward_batch, residual
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if hidden_states.numel() > 0:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 

@@ -220,4 +220,9 @@ work_dirs/
 *.app
 
 compile_commands.json
+*.trace.json*
+*nsys-rep
+*.sqlite
+test_nccl.py
+run_nccl.sh
 datafolder
