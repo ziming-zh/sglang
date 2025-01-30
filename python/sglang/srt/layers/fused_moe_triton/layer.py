@@ -308,13 +308,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         # Buffer x_remote to avoid small CPU offloads
         if not hasattr(self, "remote_forward_batch") or self.remote_forward_batch is None:
-            self.remote_buffer = [(x_remote, topk_weights_remote, topk_ids_remote, residual_remote)]
+            self.remote_buffer = []
             self.remote_forward_batch = forward_batch_remote
-
         elif x_remote.numel() > 0:
-            self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
             self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
 
+        if x_remote.numel() > 0:
+            self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
         # Only offload when buffer size is 20 or more
         if len(self.remote_buffer) >= 1:
             print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU")
