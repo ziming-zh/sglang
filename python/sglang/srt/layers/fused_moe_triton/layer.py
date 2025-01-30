@@ -340,7 +340,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     w2=w2_cpu,
                     topk_weights=topk_weights_remote_cpu,
                     topk_ids=topk_ids_remote_cpu,
-                    residual=residual_remote_cpu,
                 )
 
                 # Store CPU results mapped to the original x_remote data pointers
