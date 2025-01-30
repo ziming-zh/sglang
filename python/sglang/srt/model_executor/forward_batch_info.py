@@ -196,8 +196,8 @@ class ForwardBatch:
         local_batch.out_cache_loc, remote_batch.out_cache_loc = split_tensor(self.out_cache_loc)
 
         # Split other metadata
-        local_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
-        remote_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
+        local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
         # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
         # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
         local_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
@@ -252,10 +252,11 @@ class ForwardBatch:
         self.out_cache_loc = concat_tensor(self.out_cache_loc, other.out_cache_loc)
 
         # Modify request indices if they exist
-        if self.req_pool_indices is not None and other.req_pool_indices is not None:
-            self.req_pool_indices = torch.cat([self.req_pool_indices, other.req_pool_indices], dim=0)
-        elif other.req_pool_indices is not None:
-            self.req_pool_indices = other.req_pool_indices.clone()
+        # if self.req_pool_indices is not None and other.req_pool_indices is not None:
+        #     self.req_pool_indices = torch.cat([self.req_pool_indices, other.req_pool_indices], dim=0)
+        #     del other.req_pool_indices
+        # elif other.req_pool_indices is not None:
+        #     self.req_pool_indices = other.req_pool_indices
 
         # Merge lists in place
         # self.image_inputs = concat_list(self.image_inputs, other.image_inputs)
@@ -269,9 +270,10 @@ class ForwardBatch:
 
         # Modify attention pools in place
         print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
-        self.req_to_token_pool.combine(other.req_to_token_pool)  # Assume combine modifies in place
+        self.req_to_token_pool = other.req_to_token_pool  # This is typically a reference update
+        print(f"COMBINED: {self.token_to_kv_pool}, {other.token_to_kv_pool}")
         self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)  # Assume migration modifies in place
-
+        print(f"MIGRATED: {self.req_to_token_pool}, {other.req_to_token_pool}")
         # Update attention backend
         self.attn_backend = other.attn_backend  # This is typically a reference update
 
