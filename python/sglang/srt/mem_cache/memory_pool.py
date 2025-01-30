@@ -92,38 +92,38 @@ class ReqToTokenPool:
         for indices, values in write_records:
             self.req_to_token[indices] = values
             
-    def combine(self, other: "ReqToTokenPool") -> None:
-        """
-        Combines another ReqToTokenPool into the current one (in-place modification).
+    # def combine(self, other: "ReqToTokenPool") -> None:
+    #     """
+    #     Combines another ReqToTokenPool into the current one (in-place modification).
 
-        Args:
-            other (ReqToTokenPool): Another ReqToTokenPool instance.
-        """
-        assert isinstance(other, ReqToTokenPool), "Other pool must be an instance of ReqToTokenPool."
-        assert self.max_context_len == other.max_context_len, "max_context_len must match."
-        assert self.device == other.device, "Both pools must be on the same device."
+    #     Args:
+    #         other (ReqToTokenPool): Another ReqToTokenPool instance.
+    #     """
+    #     assert isinstance(other, ReqToTokenPool), "Other pool must be an instance of ReqToTokenPool."
+    #     assert self.max_context_len == other.max_context_len, "max_context_len must match."
+    #     assert self.device == other.device, "Both pools must be on the same device."
 
-        # Compute new total size
-        old_size = self.size
-        new_size = self.size + other.size
+    #     # Compute new total size
+    #     old_size = self.size
+    #     new_size = self.size + other.size
 
-        # Resize req_to_token tensor to accommodate new data
-        new_req_to_token = torch.zeros(
-            (new_size, self.max_context_len), dtype=torch.int32, device=self.device
-        )
-        new_req_to_token[:old_size] = self.req_to_token  # Copy old data
-        new_req_to_token[old_size:] = other.req_to_token  # Copy new data
+    #     # Resize req_to_token tensor to accommodate new data
+    #     new_req_to_token = torch.zeros(
+    #         (new_size, self.max_context_len), dtype=torch.int32, device=self.device
+    #     )
+    #     new_req_to_token[:old_size] = self.req_to_token  # Copy old data
+    #     new_req_to_token[old_size:] = other.req_to_token  # Copy new data
 
-        # Update self attributes in place
-        self.size = new_size
-        self.req_to_token = new_req_to_token  # Replace with the resized tensor
+    #     # Update self attributes in place
+    #     self.size = new_size
+    #     self.req_to_token = new_req_to_token  # Replace with the resized tensor
 
-        # Merge free slots with adjusted indices
-        self.free_slots.extend(i + old_size for i in other.free_slots)
+    #     # Merge free slots with adjusted indices
+    #     self.free_slots.extend(i + old_size for i in other.free_slots)
 
-        # Merge write records if enabled
-        if self.use_records:
-            self.write_records.extend((indices + old_size, values) for indices, values in other.write_records)
+    #     # Merge write records if enabled
+    #     if self.use_records:
+    #         self.write_records.extend((indices + old_size, values) for indices, values in other.write_records)
 
 
 class BaseTokenToKVPool:
