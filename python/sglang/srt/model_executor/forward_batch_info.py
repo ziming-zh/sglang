@@ -218,19 +218,14 @@ class ForwardBatch:
 
         return local_batch, remote_batch
 
-    def combine(self, other: "ForwardBatch") -> "ForwardBatch":
+    def combine(self, other: "ForwardBatch") -> None:
         """
-        Combines the current ForwardBatch with another ForwardBatch.
+        Combines another ForwardBatch into the current one (in-place modification).
 
         Args:
             other (ForwardBatch): Another ForwardBatch to merge with.
-
-        Returns:
-            ForwardBatch: A new merged ForwardBatch.
         """
         assert isinstance(other, ForwardBatch), "Other batch must be an instance of ForwardBatch"
-
-        merged_batch = ForwardBatch()
 
         def concat_tensor(t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]):
             if t1 is not None and t2 is not None:
@@ -238,40 +233,48 @@ class ForwardBatch:
                     return t2
                 if t2.dim() == 0:
                     return t1
-                return torch.cat([t1, t2], dim=-1)
+                return torch.cat([t1, t2], dim=0)  # In-place concatenation not possible, so reassign
             return t1 or t2
 
         def concat_list(l1: Optional[List], l2: Optional[List]):
-            return (l1 or []) + (l2 or []) if l1 is not None or l2 is not None else None
-        
-        # Merge forward mode
-        merged_batch.forward_mode = self.forward_mode
+            if l1 is None:
+                return l2
+            if l2 is None:
+                return l1
+            l1.extend(l2)  # In-place modification
+            return l1
 
-        # Merge core tensors
-        merged_batch.input_ids = concat_tensor(self.input_ids, other.input_ids)
-        merged_batch.seq_lens = concat_tensor(self.seq_lens, other.seq_lens)
-        
-        merged_batch.seq_lens_sum = self.seq_lens_sum + other.seq_lens_sum
-        merged_batch.positions = concat_tensor(self.positions, other.positions)
-        merged_batch.out_cache_loc = concat_tensor(self.out_cache_loc, other.out_cache_loc)
+        # Modify `self` directly instead of creating a new batch
+        self.input_ids = concat_tensor(self.input_ids, other.input_ids)
+        self.seq_lens = concat_tensor(self.seq_lens, other.seq_lens)
+        self.seq_lens_sum += other.seq_lens_sum
+        self.positions = concat_tensor(self.positions, other.positions)
+        self.out_cache_loc = concat_tensor(self.out_cache_loc, other.out_cache_loc)
 
-        # Merge other metadata
-        merged_batch.req_pool_indices = self.req_pool_indices.clone() if self.req_pool_indices is not None else None
-        
-        # merged_batch.image_inputs = concat_list(self.image_inputs, other.image_inputs)
-        # merged_batch.lora_paths = concat_list(self.lora_paths, other.lora_paths)
-        merged_batch.sampling_info = self.sampling_info or other.sampling_info
+        # Modify request indices if they exist
+        if self.req_pool_indices is not None and other.req_pool_indices is not None:
+            self.req_pool_indices = torch.cat([self.req_pool_indices, other.req_pool_indices], dim=0)
+        elif other.req_pool_indices is not None:
+            self.req_pool_indices = other.req_pool_indices.clone()
 
-        # Compute new batch size
-        merged_batch.batch_size = (self.batch_size or 0) + (other.batch_size or 0)
-        
-        # Copy attention backend
-        merged_batch.req_to_token_pool = self.req_to_token_pool.combine(other.req_to_token_pool)
-        merged_batch.token_to_kv_pool = self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)
-        merged_batch.attn_backend = other.attn_backend
-        
+        # Merge lists in place
+        # self.image_inputs = concat_list(self.image_inputs, other.image_inputs)
+        # self.lora_paths = concat_list(self.lora_paths, other.lora_paths)
 
-        return merged_batch
+        # Update sampling info
+        self.sampling_info = self.sampling_info or other.sampling_info
+
+        # Update batch size
+        self.batch_size += other.batch_size
+
+        # Modify attention pools in place
+        print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
+        self.req_to_token_pool.combine(other.req_to_token_pool)  # Assume combine modifies in place
+        self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)  # Assume migration modifies in place
+
+        # Update attention backend
+        self.attn_backend = other.attn_backend  # This is typically a reference update
+
 
     
     def compute_mrope_positions(
