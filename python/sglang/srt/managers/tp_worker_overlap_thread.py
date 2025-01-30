@@ -135,9 +135,20 @@ class TpModelWorkerClient:
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
+            
+            
+            # TODO: this is fake now, create a fake next_token_ids to align the future_token_ids_map (size: row of future_token_ids_map, col of bs)
+            fake_next_token_ids = torch.arange(
+                0,
+                bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            
+            
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids
+            ] = fake_next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
