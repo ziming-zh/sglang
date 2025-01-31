@@ -272,7 +272,8 @@ class ForwardBatch:
         print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
         self.req_to_token_pool = other.req_to_token_pool  # This is typically a reference update
         print(f"COMBINED: {self.token_to_kv_pool}, {other.token_to_kv_pool}")
-        self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)  # Assume migration modifies in place
+        # self.token_to_kv_pool.migrate_kv_buffer(other.token_to_kv_pool)  # Assume migration modifies in place (kvcache is global)
+        self.token_to_kv_pool = other.token_to_kv_pool  # This is typically a reference update
         print(f"MIGRATED: {self.req_to_token_pool}, {other.req_to_token_pool}")
         # Update attention backend
         self.attn_backend = other.attn_backend  # This is typically a reference update
