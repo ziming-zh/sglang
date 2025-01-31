@@ -256,11 +256,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        # print("set_kv_buffer")
-        # print(f"layer: {layer}")
-        # print(f"loc: {loc}")
-        # print(f"cache_k's shape: {cache_k.shape}")
-        # print(f"cache_v's shape: {cache_v.shape}")
+        print("set_kv_buffer")
+        print(f"loc: {loc}")
+        print(f"cache_k's shape: {cache_k.shape}")
+        print(f"cache_v's shape: {cache_v.shape}")
+        print(f"k_buffer's shape: {self.k_buffer[layer.layer_id].shape}")
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)

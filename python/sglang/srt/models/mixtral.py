@@ -276,7 +276,14 @@ class MixtralDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        print(f"[MIXTRAL]Hidden states shape before moe: {hidden_states.shape}")
+        print(f"[MIXTRAL]Residual shape before moe: {residual.shape}")
+        
         hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
+        print(f"[MIXTRAL]Hidden states shape after moe: {hidden_states.shape}")
+        print(f"[MIXTRAL]Residual shape after moe: {residual.shape}")
+        
         return hidden_states, residual, forward_batch
 
 
