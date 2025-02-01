@@ -117,10 +117,15 @@ class MixtralMoE(nn.Module):
         
         available_experts = self.experts.available_experts
         
+        print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
+        print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
+        
+        print(f"[MIXTRAL MoE]Final hidden states shape: {final_hidden_states.shape}")
+        
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
             
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
@@ -219,6 +224,7 @@ class MixtralDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = MixtralAttention(
@@ -253,7 +259,9 @@ class MixtralDecoderLayer(nn.Module):
     ):
         # Self Attention
         # quit if hidden_states and residual are empty
+        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         if hidden_states.numel() == 0 and residual.numel() == 0:
+            print(f"[Mixtral layer {self.layer_id}]Both hidden states and residual are empty")
             return hidden_states, residual, forward_batch
         
         if residual is None:
@@ -277,12 +285,14 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        print(f"[MIXTRAL]Hidden states shape before moe: {hidden_states.shape}")
-        print(f"[MIXTRAL]Residual shape before moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
-        print(f"[MIXTRAL]Hidden states shape after moe: {hidden_states.shape}")
-        print(f"[MIXTRAL]Residual shape after moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         return hidden_states, residual, forward_batch
 
@@ -331,6 +341,8 @@ class MixtralModel(nn.Module):
             )
         if hidden_states.numel() > 0:
             hidden_states, _ = self.norm(hidden_states, residual)
+            
+        print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
         return hidden_states
 
 

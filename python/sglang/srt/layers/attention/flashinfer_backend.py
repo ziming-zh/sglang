@@ -292,6 +292,9 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         decode_wrapper = self.forward_metadata[0][self._get_wrapper_idx(layer)]
+        print(f"is_cross_attention: {layer.is_cross_attention}")
+        print(f"[FLASHINFER] out_cache_loc: {forward_batch.out_cache_loc}")
+        print(f"[FLASHINFER] encoder_out_cache_loc: {forward_batch.encoder_out_cache_loc}")
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
