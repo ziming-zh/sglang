@@ -395,7 +395,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # Clear buffer
             self.remote_buffer = []
             self.remote_forward_batch = None
-            
+        
+        # do computation on GPU
+        x_local = fused_experts(
+            hidden_states=x_local,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights_local,
+            topk_ids=topk_ids_local,
+            inplace=True,
+        )
 
         # retrieve results from the worker process
         self.retrieve_results()
@@ -428,15 +437,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             
         print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
         print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
+        
+        forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
+        print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
 
-        return fused_experts(
-            hidden_states=x_local,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights_local,
-            topk_ids=topk_ids_local,
-            inplace=True,
-        ), residual_local, forward_batch_local
+        return x_local, residual_local, forward_batch_local
 
     def forward_cpu(self, *args, **kwargs):
         raise NotImplementedError("The CPU backend currently does not support MoE.")
@@ -1085,10 +1090,14 @@ class FusedMoE(torch.nn.Module):
         
         print(f"[FORWARD] after quant_method.apply")
         print(f"forward_batch.out_cache_loc: {forward_batch.out_cache_loc}")
+        
+        print(f"[FINAL before all-reduce] final_hidden_states: {final_hidden_states.shape}")
 
         # Perform a tensor parallel all-reduce if necessary
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            
+        print(f"[FINAL after all-reduce] final_hidden_states: {final_hidden_states.shape}")
 
         return final_hidden_states, residual, forward_batch
 
