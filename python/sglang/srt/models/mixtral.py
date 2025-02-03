@@ -122,11 +122,12 @@ class MixtralMoE(nn.Module):
         final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
         print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
         
-        print(f"[MIXTRAL MoE]Final hidden states shape: {final_hidden_states.shape}")
+        print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
         
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
-            
+            final_hidden_states[forward_batch.is_local_toks] = tensor_model_parallel_all_reduce(final_hidden_states[forward_batch.is_local_toks]) # This all-reduce is causing problem, and we only need to do the all-to-all for 
+        
+        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}")
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
         ### assert that there should be nothing to collect during the prefilling phase
@@ -281,17 +282,18 @@ class MixtralDecoderLayer(nn.Module):
         # hidden_states = self.speculation_logit(hidden_states)
         
         is_decode_mode = forward_batch.forward_mode.is_decode()
+        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before post attention: {forward_batch.out_cache_loc}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}")
-        print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
+        print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
         print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}")
-        print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
+        print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         return hidden_states, residual, forward_batch

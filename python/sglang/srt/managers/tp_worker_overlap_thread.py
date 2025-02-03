@@ -132,6 +132,9 @@ class TpModelWorkerClient:
             logits_output, next_token_ids = self.worker.forward_batch_generation(
                 model_worker_batch, self.launch_done
             )
+            print("Run forward batch generation complete")
+            print("logits_output: ", logits_output)
+            print("next_token_ids: ", next_token_ids)
 
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
@@ -145,7 +148,7 @@ class TpModelWorkerClient:
                 dtype=torch.int32,
                 device=self.device,
             )
-            
+            print("Create random next_token_ids to align the future_token_ids_map")
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = fake_next_token_ids

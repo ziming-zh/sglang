@@ -308,6 +308,8 @@ def extend_attention_fwd(
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    print(f"b_seq_len shape: {b_seq_len.shape}")
+    print(f"b_seq_len_extend shape: {b_seq_len_extend.shape}")
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 

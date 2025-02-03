@@ -291,6 +291,7 @@ class ForwardBatch:
             print(f"positions_list: {positions_list} len: {len(positions_list)}")
             self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
             print(f"self.positions: {self.positions}")
+            print("[BEFORE COMBINE] self.out_cache_loc: ", self.out_cache_loc)
             self.out_cache_loc = out_cache_loc_list[0] if len(out_cache_loc_list) == 1 else torch.cat(out_cache_loc_list, dim=0) if out_cache_loc_list else None
             print("[COMBINE] self.out_cache_loc: ", self.out_cache_loc)
             self.encoder_out_cache_loc = (

@@ -134,7 +134,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                     per_req_query_redudant.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
+                    # enable_gqa=enable_gqa,
                     scale=scaling,
                     is_causal=causal,
                 )

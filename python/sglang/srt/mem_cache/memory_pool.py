@@ -260,7 +260,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         print(f"loc: {loc}")
         print(f"cache_k's shape: {cache_k.shape}")
         print(f"cache_v's shape: {cache_v.shape}")
-        print(f"k_buffer's shape: {self.k_buffer[layer.layer_id].shape}")
+        print(f"[Before] k_buffer's shape: {self.k_buffer[layer.layer_id].shape}")
+        print(f"[Before] v_buffer's shape: {self.v_buffer[layer.layer_id].shape}")
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)

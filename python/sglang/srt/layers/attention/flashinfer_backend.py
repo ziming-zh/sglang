@@ -295,6 +295,9 @@ class FlashInferAttnBackend(AttentionBackend):
         print(f"is_cross_attention: {layer.is_cross_attention}")
         print(f"[FLASHINFER] out_cache_loc: {forward_batch.out_cache_loc}")
         print(f"[FLASHINFER] encoder_out_cache_loc: {forward_batch.encoder_out_cache_loc}")
+        print(f"[FLASHINFER] q_shape: {q.shape}")
+        print(f"[FLASHINFER] k_shape: {k.shape}")
+        print(f"[FLASHINFER] v_shape: {v.shape}")
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -305,6 +308,7 @@ class FlashInferAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                print(f"[FLASHINFER] after set_kv_buffer: out_cache_loc {forward_batch.out_cache_loc}")
 
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -312,6 +316,7 @@ class FlashInferAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
         )
+        print(f"[FLASHINFER] after decode_wrapper forward: out_cache_loc {forward_batch.out_cache_loc}")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
