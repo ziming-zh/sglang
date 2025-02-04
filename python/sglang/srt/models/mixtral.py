@@ -126,8 +126,9 @@ class MixtralMoE(nn.Module):
         
         if self.tp_size > 1:
             final_hidden_states[forward_batch.is_local_toks] = tensor_model_parallel_all_reduce(final_hidden_states[forward_batch.is_local_toks]) # This all-reduce is causing problem, and we only need to do the all-to-all for 
-        
+        torch.cuda.synchronize()
         print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}")
+        print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
         ### assert that there should be nothing to collect during the prefilling phase
@@ -207,9 +208,28 @@ class MixtralAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        print(f"[MIXTRAL Attention]Forward batch: {forward_batch}")
         qkv, _ = self.qkv_proj(hidden_states)
+        print(f"[MIXTRAL qkv_proj]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        print("Query storage:", q.storage().data_ptr())
+        print("Key storage:", k.storage().data_ptr())
+        print("Position storage:", positions.storage().data_ptr())
+        print("Forward batch storage:", forward_batch.out_cache_loc.storage().data_ptr())
+        positions = positions.clone()
+        print("Position storage after clone:", positions.storage().data_ptr())
+        # check the size of q, k before and after rotary_emb
+        print(f"[MIXTRAL Attention]q shape: {q.shape}")
+        print(f"[MIXTRAL Attention]k shape: {k.shape}")
+        
         q, k = self.rotary_emb(positions, q, k)
+        
+        print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
+        print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
+        print("Query storage:", q.storage().data_ptr())
+        print("Key storage:", k.storage().data_ptr())
+        print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -272,6 +292,7 @@ class MixtralDecoderLayer(nn.Module):
             print(f"[Testing]Residual shape: {residual.shape}")
             print(f"[Testing]Hidden states shape: {hidden_states.shape}")
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before self_attn: {forward_batch.out_cache_loc}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
