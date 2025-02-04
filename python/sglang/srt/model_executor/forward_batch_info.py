@@ -178,7 +178,7 @@ class ForwardBatch:
 
 
         
-        local_batch = ForwardBatch()
+        local_batch = self
         remote_batch = ForwardBatch()
         
         local_batch.forward_mode = self.forward_mode
@@ -186,8 +186,8 @@ class ForwardBatch:
 
         # Split core tensors
         local_batch.input_ids, remote_batch.input_ids = split_tensor(self.input_ids)
-        local_batch.seq_lens = local_mask.sum(dim=-1)
-        remote_batch.seq_lens = remote_mask.sum(dim=-1)
+        local_batch.seq_lens = local_mask.sum(dim=-1, keepdim=True)
+        remote_batch.seq_lens = remote_mask.sum(dim=-1, keepdim=True)
         
         local_batch.seq_lens_sum = local_batch.seq_lens.sum().item()
         remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item()
@@ -286,7 +286,7 @@ class ForwardBatch:
             print(f"seq_lens_list: {seq_lens_list} len: {len(seq_lens_list)}")
             # add seq_len up in seq_lens_list
             
-            self.seq_lens = torch.tensor(sum(t.item() for t in seq_lens_list))
+            self.seq_lens = torch.tensor([sum(t.item() for t in seq_lens_list)],device=self.seq_lens.device)
             print(f"self.seq_lens: {self.seq_lens}")
             print(f"positions_list: {positions_list} len: {len(positions_list)}")
             self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
