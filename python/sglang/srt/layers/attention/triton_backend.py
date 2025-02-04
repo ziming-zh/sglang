@@ -134,6 +134,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
+        print("Triton backend forward_extend: forward_batch", forward_batch)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -174,6 +175,7 @@ class TritonAttnBackend(AttentionBackend):
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         if save_kv_cache:
+            print("[Triton backend] forward_decode: forward_batch", forward_batch)
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )

@@ -54,7 +54,7 @@ class RadixAttention(nn.Module):
             assert v is not None
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-
+        print("[RadixAttention] forward: forward_batch", forward_batch)
         return forward_batch.attn_backend.forward(
             q, k, v, self, forward_batch, save_kv_cache
         )

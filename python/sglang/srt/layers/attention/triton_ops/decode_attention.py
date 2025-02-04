@@ -19,6 +19,7 @@ It supports page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_nopad_att1.py
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/token_attention_softmax_and_reducev.py
+import torch
 import triton
 import triton.language as tl
 
@@ -641,18 +642,43 @@ def decode_attention_fwd_grouped(
     sm_scale,
     logit_cap=0.0,
 ):
+    # List all arguments
+    args = {
+        "q": q,
+        "k_buffer": k_buffer,
+        "v_buffer": v_buffer,
+        "o": o,
+        "req_to_token": req_to_token,
+        "b_req_idx": b_req_idx,
+        "b_start_loc": b_start_loc,
+        "b_seq_len": b_seq_len,
+        "attn_logits": attn_logits,
+        "max_len_in_batch": max_len_in_batch,
+        "sm_scale": sm_scale,
+        "logit_cap": logit_cap,
+    }
+
+    # Print argument information
+    for name, arg in args.items():
+        if isinstance(arg, torch.Tensor):
+            print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
+        else:
+            print(f"{name}: type={type(arg)}, value={arg}")
+
+    # Call Triton kernel with the corrected arguments
     _decode_grouped_att_m_fwd(
-        q,
-        k_buffer,
-        attn_logits,
-        req_to_token,
-        b_req_idx,
-        b_start_loc,
-        b_seq_len,
-        max_len_in_batch,
-        sm_scale,
-        logit_cap,
+        args["q"],
+        args["k_buffer"],
+        args["attn_logits"],
+        args["req_to_token"],
+        args["b_req_idx"],
+        args["b_start_loc"],
+        args["b_seq_len"],
+        args["max_len_in_batch"],
+        args["sm_scale"],
+        args["logit_cap"],
     )
+
     _decode_grouped_softmax_reducev_fwd(
         attn_logits,
         v_buffer,

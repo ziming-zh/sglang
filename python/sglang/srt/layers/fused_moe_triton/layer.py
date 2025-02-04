@@ -331,6 +331,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             is_decode_mode=is_decode_mode,
         )
+        # make sure is_remote_toks on the same device as x
+        is_remote_toks = is_remote_toks.to(x.device)
 
         x_remote = x[is_remote_toks]
         x_local = x[~is_remote_toks]
@@ -415,10 +417,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         fetched_cpu_results = []
         fetched_residuals = []
         fetched_forward_batch = []
+        device = x_local.device
         for key, cpu_result in list(self.cpu_buffer.items()):
             # with torch.cuda.stream(self.stream_gpu):
-            gpu_result = cpu_result[0].to("cuda", non_blocking=True)
-            residual_gpu = cpu_result[1].to("cuda", non_blocking=True)
+            gpu_result = cpu_result[0].to(device, non_blocking=True)
+            residual_gpu = cpu_result[1].to(device, non_blocking=True) if cpu_result[1] is not None else None
             forward_batch_remote = cpu_result[2]
             fetched_cpu_results.append(gpu_result)
             fetched_residuals.append(residual_gpu)

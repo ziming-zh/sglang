@@ -94,6 +94,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+        print("shape of query, output, k_cache, v_cache")
+        print(query.shape, query.device)
+        print(output.shape, output.device)
+        print(k_cache.shape, k_cache.device)
+        print(v_cache.shape, v_cache.device)
 
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
@@ -128,6 +133,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+            
+            print("shape of per_req_query_redudant, per_req_key, per_req_value")
+            print(per_req_query_redudant.shape, per_req_query_redudant.device)
+            print(per_req_key.shape, per_req_key.device)
+            print(per_req_value.shape, per_req_value.device)
 
             per_req_out_redudant = (
                 scaled_dot_product_attention(
