@@ -91,8 +91,9 @@ def cpu_offload_worker(task_queue, result_queue, w13_cpu, w2_cpu):
             if result_queue.full():
                 print(f"Result queue is full, failed to put task {task_id}")
             else:
-                result_queue.put((task_id, cpu_result), timeout=10)
-                print(f"Offload task {task_id} completed at time {time.time()}")
+                # print(f"Offload task {task_id} completed at time {time.time()}")
+                result_queue.put((task_id, cpu_result))
+                
 
         except Exception as e:
             print(f"Error in CPU offloading worker: {e}")
@@ -103,17 +104,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Create a queue for offloading tasks and a queue for results
-        self.task_queue = mp.Queue(maxsize=40)
-        self.result_queue = mp.Queue(maxsize=40)
-        
-        self.task_metadata = {}
-
-        self.cpu_buffer = {}
-        
-        # set up CUDA streams for async offloading
-        self.stream_cpu = torch.cuda.Stream()
-        self.stream_gpu = torch.cuda.Stream()
 
     def create_weights(
         self,
@@ -125,6 +115,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         available_experts: Optional[List[bool]] = None,  # New argument for availability
         **extra_weight_attrs,
     ):
+        self.layer_id = layer.layer_id
         # Default to all experts being available if not specified
         if available_experts is None:
             available_experts = [True] * num_experts
@@ -172,8 +163,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.w13_cpu = w13_weight.cpu()  # Simulate CPU expert weights
         self.w2_cpu = w2_weight.cpu()  # Simulate CPU expert weights
         
+        
+        # Create a queue for offloading tasks and a queue for results
+        self.task_queue = mp.Queue(maxsize=40)
+        self.result_queue = mp.Queue(maxsize=40)
+        
+        self.task_metadata = {}
+
+        self.cpu_buffer = {}
+        
+        # set up CUDA streams for async offloading
+        self.stream_cpu = torch.cuda.Stream()
+        self.stream_gpu = torch.cuda.Stream()
+        
+        UnquantizedFusedMoEMethod.init_shared_dict()
         # Start the worker process for CPU offloading
-        self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.w13_cpu, self.w2_cpu))
+        self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.w13_cpu, self.w2_cpu, UnquantizedFusedMoEMethod.shared_dict))
         self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
         self.worker_process.start()
 
@@ -346,7 +351,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         
         forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
         
-        print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}")
+        # print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}")
         
         if residual is not None:
             residual_remote = residual[is_remote_toks]
@@ -419,6 +424,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         fetched_forward_batch = []
         device = x_local.device
         for key, cpu_result in list(self.cpu_buffer.items()):
+
+            print(f"[Task {key}] finished at {time.time()}")
             # with torch.cuda.stream(self.stream_gpu):
             gpu_result = cpu_result[0].to(device, non_blocking=True)
             residual_gpu = cpu_result[1].to(device, non_blocking=True) if cpu_result[1] is not None else None
@@ -426,23 +433,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             fetched_cpu_results.append(gpu_result)
             fetched_residuals.append(residual_gpu)
             fetched_forward_batch.append(forward_batch_remote)
-            print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
+            # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
+            del self.cpu_buffer[key]
 
         if len(fetched_cpu_results) > 0:
-            print(f"Combined {len(fetched_cpu_results)} remote results at {time.time()}")
-            print(f"fetched_gpu_results: {fetched_cpu_results}")
+            # print(f"Combined {len(fetched_cpu_results)} remote results at {time.time()}")
+            # print(f"fetched_gpu_results: {fetched_cpu_results}")
             x_local = torch.cat([x_local] + fetched_cpu_results, dim=0)
             if residual_local is not None:
                 residual_local = torch.cat([residual_local] + fetched_residuals, dim=0)
-            print(f"[Combine before] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
+            # print(f"[Combine before] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
             forward_batch_local.combine(fetched_forward_batch)
-            print(f"[Combine after] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
+            # print(f"[Combine after] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
             
-        print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
-        print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
+        # print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
+        # print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
         
         forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
-        print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
+        # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
 
         return x_local, residual_local, forward_batch_local
 
@@ -463,7 +471,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             self.cpu_buffer[task_id] = cpu_result, residual_remote_cpu, forward_batch_remote
             # remove the task metadata
             del self.task_metadata[task_id]
-            print(f"Retrieved result for {task_id} at {time.time()}")
+            print(f"[layer {self.layer_id}] Task {task_id} retrieved at {time.time()}")
 
     def __del__(self):
         """
@@ -593,6 +601,7 @@ class FusedMoE(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        layer_id: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         available_experts: Optional[List[bool]] = None,
     ):
@@ -605,6 +614,7 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        self.layer_id = layer_id
         self.top_k = top_k
         self.num_experts = num_experts
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -1091,8 +1101,8 @@ class FusedMoE(torch.nn.Module):
             forward_batch=forward_batch,
         )
         
-        print(f"[FORWARD] after quant_method.apply")
-        print(f"forward_batch.out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[FORWARD] after quant_method.apply")
+        # print(f"forward_batch.out_cache_loc: {forward_batch.out_cache_loc}")
         
         print(f"[FINAL before all-reduce] final_hidden_states: {final_hidden_states.shape}")
 

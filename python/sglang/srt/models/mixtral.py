@@ -66,6 +66,7 @@ class MixtralMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        layer_id: int = 0,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -91,6 +92,7 @@ class MixtralMoE(nn.Module):
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
+            layer_id=layer_id,
         )
         self.swap_experts=True
        
@@ -265,6 +267,7 @@ class MixtralDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
+            layer_id=layer_id,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
