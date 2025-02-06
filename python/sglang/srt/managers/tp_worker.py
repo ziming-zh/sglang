@@ -29,7 +29,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, set_random_seed
+from sglang.srt.utils import CompleteTokenQueryService, broadcast_pyobj, set_random_seed
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,11 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Parse args
         self.tp_rank = tp_rank
+        self.complete_token_manager = complete_token_manager
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -67,6 +69,7 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            complete_token_manager=complete_token_manager,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

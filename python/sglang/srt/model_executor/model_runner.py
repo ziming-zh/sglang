@@ -51,6 +51,7 @@ from sglang.srt.model_loader import get_model
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    CompleteTokenQueryService,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -75,9 +76,11 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Parse args
         self.model_config = model_config
+        self.complete_token_manager = complete_token_manager
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
@@ -645,7 +648,7 @@ class ModelRunner:
         forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
         self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+            forward_batch.input_ids, forward_batch.positions, forward_batch, complete_token_manager=self.complete_token_manager
         )
 
     def forward_extend(self, forward_batch: ForwardBatch):

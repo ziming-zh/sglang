@@ -74,6 +74,7 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerSta
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    CompleteTokenQueryService,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
@@ -101,6 +102,7 @@ class Scheduler:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -113,6 +115,7 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.complete_token_manager = complete_token_manager
 
         # Session info
         self.sessions = {}
@@ -197,6 +200,7 @@ class Scheduler:
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            complete_token_manager=complete_token_manager,
         )
 
         # Get token and memory info from the model worker
@@ -1468,6 +1472,7 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    complete_token_manager: Optional[CompleteTokenQueryService] = None,
 ):
     # set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
@@ -1486,7 +1491,7 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank, complete_token_manager)
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
         )

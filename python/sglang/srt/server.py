@@ -77,6 +77,7 @@ from sglang.srt.openai_api.adapter import (
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    CompleteTokenQueryService,
     add_api_key_middleware,
     add_prometheus_middleware,
     assert_pkg_version,
@@ -108,7 +109,6 @@ app.add_middleware(
 
 tokenizer_manager: TokenizerManager = None
 scheduler_info: Dict = None
-
 ##### Native API endpoints #####
 
 
@@ -424,6 +424,7 @@ def launch_engine(
 
     global tokenizer_manager
     global scheduler_info
+    global complete_token_manager
 
     # Configure global environment
     configure_logger(server_args)
@@ -448,12 +449,14 @@ def launch_engine(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
+        manager = mp.Manager()
+        complete_token_manager = CompleteTokenQueryService(tp_rank_range.stop, manager)
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                args=(server_args, port_args, gpu_id, tp_rank, None, writer, complete_token_manager),
             )
             proc.start()
             scheduler_procs.append(proc)

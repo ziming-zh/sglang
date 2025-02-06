@@ -23,6 +23,7 @@ from typing import Optional
 import psutil
 import torch
 
+from python.sglang.srt.utils import CompleteTokenQueryService
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -56,9 +57,10 @@ class TpModelWorkerClient:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port)
+        self.worker = TpModelWorker(server_args, gpu_id, tp_rank, dp_rank, nccl_port, complete_token_manager)
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
         self.gpu_id = gpu_id
