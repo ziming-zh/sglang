@@ -57,6 +57,9 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
+import multiprocessing as mp
+from multiprocessing import shared_memory, Manager, Lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1263,3 +1266,55 @@ def should_use_tensor_core(
         return gqa_group_size > 4
     else:
         return False
+
+class CompleteTokenQueryService:
+    def __init__(self, tp_rank_range, manager, num_layers=32):
+        self.tp_rank_range = tp_rank_range
+        self.lock = manager.Lock()  # Manager Lock for atomic access
+
+        # Dictionary-based cache: cache_key[layer_id] and cache_value[layer_id]
+        self.cache_key = manager.dict({layer_id: f"layer_{layer_id}" for layer_id in range(num_layers)})
+        self.cache_value = manager.dict({layer_id: [] for layer_id in range(num_layers)})
+
+        # Each layer has its own compute_cnt dictionary
+        self.compute_cnt = manager.dict({layer_id: manager.dict() for layer_id in range(num_layers)})
+
+    def update_token(self, token, layer_id):
+        """Atomically update the computation count for a specific token in the given layer."""
+        with self.lock:
+            layer_compute_cnt = self.compute_cnt[layer_id]  # Access specific layer compute count
+
+            if token in layer_compute_cnt:
+                layer_compute_cnt[token] += 1
+            else:
+                layer_compute_cnt[token] = 1
+            print(f"Token {token} updated in Layer {layer_id}: {layer_compute_cnt[token]}")
+
+    def query(self, round_id, layer_id):
+        """Query completed tokens for a specific layer_id key."""
+        key = f"{round_id}.{layer_id}"
+
+        with self.lock:
+            # Cache hit: Return stored result
+            if self.cache_key.get(layer_id) == key:
+                print(f"Cache hit for layer {layer_id}: {self.cache_value[layer_id]}")
+                return list(self.cache_value[layer_id])  # Convert to list for safety
+
+            finished_tokens = []
+            layer_compute_cnt = self.compute_cnt[layer_id]  # Access layer-specific compute count
+
+            for token, count in list(layer_compute_cnt.items()):  # Use list() to avoid runtime error
+                if count == self.tp_rank_range:
+                    finished_tokens.append(token)
+                    print(f"Token {token} finished in Layer {layer_id}: {count}")
+                    # Delete the token from the compute count
+                    del layer_compute_cnt[token]
+
+            # if len(finished_tokens) > 0:
+            print(f"Cache miss for layer {layer_id}: {finished_tokens}")
+
+            # Update cache entry for the layer
+            self.cache_key[layer_id] = key
+            self.cache_value[layer_id] = finished_tokens  # Store finished tokens for this layer
+
+            return finished_tokens
