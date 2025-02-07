@@ -97,7 +97,7 @@ class MixtralMoE(nn.Module):
         )
         self.swap_experts=True
        
-    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, complete_token_manager: Optional[CompleteTokenQueryService] = None):
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, complete_token_manager: Optional[CompleteTokenQueryService] = None, task_queue=None, result_queue=None):
         if(self.swap_experts==True):
             print("[Testing]Swapping experts")
             import time
@@ -122,7 +122,7 @@ class MixtralMoE(nn.Module):
         
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager)
+        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager, task_queue=task_queue, result_queue=result_queue)
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
         
         # print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
@@ -131,11 +131,13 @@ class MixtralMoE(nn.Module):
             if is_decode_mode:
                 print(f"[Testing]Final hidden states shape: {final_hidden_states.shape}")
                 print(f"[Testing]Forward batch is_local_toks: {forward_batch.is_local_toks}")
-                final_hidden_states[forward_batch.is_local_toks] = tensor_model_parallel_all_reduce(final_hidden_states[forward_batch.is_local_toks]) # This all-reduce is causing problem, and we only need to do the all-to-all for 
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                
+        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
         torch.cuda.synchronize()
-        # print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}")
+        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
         # print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
@@ -226,7 +228,7 @@ class MixtralAttention(nn.Module):
         # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape before rotary_emb: {k.shape}")
         
-        # q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
         
         # print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
@@ -309,16 +311,17 @@ class MixtralDecoderLayer(nn.Module):
         
         is_decode_mode = forward_batch.forward_mode.is_decode()
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before post attention: {forward_batch.out_cache_loc}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before post-attention: {hidden_states.shape}, device: {hidden_states.device}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager)
-        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
+        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager, task_queue=self.task_queue, result_queue=self.result_queue)
+        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
@@ -349,6 +352,24 @@ class MixtralModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Create a queue for offloading tasks and a queue for results
+        import multiprocessing as mp
+        from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
+        self.task_queue = mp.Queue(maxsize=40)
+        self.result_queue = mp.Queue(maxsize=40)
+        
+        self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
+        self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
+        
+        self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.w13_cpu, self.w2_cpu))
+        self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
+        self.worker_process.start()
+        
+        # register task_queue and result_queue to each layer
+        for layer in self.layers:
+            layer.task_queue = self.task_queue
+            layer.result_queue = self.result_queue
 
     def forward(
         self,
