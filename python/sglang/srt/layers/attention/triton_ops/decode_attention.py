@@ -658,12 +658,12 @@ def decode_attention_fwd_grouped(
         "logit_cap": logit_cap,
     }
 
-    # Print argument information
-    for name, arg in args.items():
-        if isinstance(arg, torch.Tensor):
-            print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
-        else:
-            print(f"{name}: type={type(arg)}, value={arg}")
+    # # Print argument information
+    # for name, arg in args.items():
+    #     if isinstance(arg, torch.Tensor):
+    #         print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
+    #     else:
+    #         print(f"{name}: type={type(arg)}, value={arg}")
 
     # Call Triton kernel with the corrected arguments
     _decode_grouped_att_m_fwd(
@@ -688,6 +688,8 @@ def decode_attention_fwd_grouped(
         b_start_loc,
         b_seq_len,
     )
+    
+    print(f"Triton kernel called successfully, cuda {args['q'].device}")
 
 
 def decode_attention_fwd(

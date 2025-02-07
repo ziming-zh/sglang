@@ -172,6 +172,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        # self.init_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         if save_kv_cache:
@@ -179,7 +180,8 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-
+        # print(f"[Triton backend cuda {self.device}] forward_decode: forward_batch", forward_batch)
+        # print(f"[Triton backend cuda {self.device}] forward_decode: start_loc", start_loc)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),

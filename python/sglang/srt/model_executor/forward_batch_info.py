@@ -267,11 +267,11 @@ class ForwardBatch:
             self.batch_size += other.batch_size
 
             # Modify attention pools in place
-            print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
+            # print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
             self.req_to_token_pool = other.req_to_token_pool  # Reference update
-            print(f"COMBINED: {self.token_to_kv_pool}, {other.token_to_kv_pool}")
+            # print(f"COMBINED: {self.token_to_kv_pool}, {other.token_to_kv_pool}")
             self.token_to_kv_pool = other.token_to_kv_pool  # Reference update
-            print(f"MIGRATED: {self.req_to_token_pool}, {other.req_to_token_pool}")
+            # print(f"MIGRATED: {self.req_to_token_pool}, {other.req_to_token_pool}")
 
             # Update sampling info
             self.sampling_info = self.sampling_info or other.sampling_info
