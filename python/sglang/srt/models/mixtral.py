@@ -136,7 +136,7 @@ class MixtralMoE(nn.Module):
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
                 
         print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
         # print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         ### TODO: Add collect logic here
@@ -357,7 +357,7 @@ class MixtralModel(nn.Module):
         import multiprocessing as mp
         from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
         self.task_queue = mp.Queue(maxsize=40)
-        self.result_queue = mp.Queue(maxsize=40)
+        self.result_queue = [mp.Queue(maxsize=40) for _ in range(config.num_hidden_layers)]
         
         self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
         self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
@@ -367,9 +367,9 @@ class MixtralModel(nn.Module):
         self.worker_process.start()
         
         # register task_queue and result_queue to each layer
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             layer.task_queue = self.task_queue
-            layer.result_queue = self.result_queue
+            layer.result_queue = self.result_queue[layer_id]
 
     def forward(
         self,

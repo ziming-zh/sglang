@@ -64,7 +64,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-def cpu_offload_worker(task_queue, result_queue, w13_cpu, w2_cpu):
+def cpu_offload_worker(task_queue, result_queue_list, w13_cpu, w2_cpu):
     """
     Worker function that runs in a separate process to handle CPU offloading.
     """
@@ -88,7 +88,7 @@ def cpu_offload_worker(task_queue, result_queue, w13_cpu, w2_cpu):
         )
 
         # Store the result in a shared queue
-        
+        result_queue = result_queue_list[layer_id]
         if result_queue.full():
             print(f"Result queue is full, failed to put task {task_id}")
         else:
