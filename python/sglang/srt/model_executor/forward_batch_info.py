@@ -199,8 +199,12 @@ class ForwardBatch:
         local_batch.encoder_out_cache_loc, remote_batch.encoder_out_cache_loc = split_tensor(self.encoder_out_cache_loc)
 
         # Split other metadata
-        local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
-        remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        # local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        # remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        print(f"[SPLIT] self.req_pool_indices: {self.req_pool_indices}")
+        local_batch.req_pool_indices, remote_batch.req_pool_indices = split_tensor(self.req_pool_indices)
+        print(f"[SPLIT] local_batch.req_pool_indices: {local_batch.req_pool_indices}")
+        print(f"[SPLIT] remote_batch.req_pool_indices: {remote_batch.req_pool_indices}")
         # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
         # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
         local_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
@@ -242,6 +246,7 @@ class ForwardBatch:
         positions_list = [self.positions] if is_valid_tensor(self.positions) else []
         out_cache_loc_list = [self.out_cache_loc] if is_valid_tensor(self.out_cache_loc) else []
         encoder_out_cache_loc_list = [self.encoder_out_cache_loc] if is_valid_tensor(self.encoder_out_cache_loc) else []
+        req_pool_indices_list = [self.req_pool_indices] if is_valid_tensor(self.req_pool_indices) else []
         print(f"seq_lens_list: {seq_lens_list}")
         image_inputs_list = self.image_inputs if self.image_inputs is not None else []
         lora_paths_list = self.lora_paths if self.lora_paths is not None else []
@@ -262,6 +267,9 @@ class ForwardBatch:
                 image_inputs_list.extend(other.image_inputs)
             if other.lora_paths is not None:
                 lora_paths_list.extend(other.lora_paths)
+            
+            if other.req_pool_indices is not None:
+                req_pool_indices_list.append(other.req_pool_indices)
 
             self.seq_lens_sum += other.seq_lens_sum
             self.batch_size += other.batch_size
@@ -298,6 +306,12 @@ class ForwardBatch:
                 encoder_out_cache_loc_list[0] if len(encoder_out_cache_loc_list) == 1 else torch.cat(encoder_out_cache_loc_list, dim=0)
                 if encoder_out_cache_loc_list else None
             )
+            
+            print(f"[BEFORE COMBINE] self.req_pool_indices: {self.req_pool_indices}")
+            self.req_pool_indices = req_pool_indices_list[0] if len(req_pool_indices_list) == 1 else torch.cat(req_pool_indices_list, dim=0) if req_pool_indices_list else None
+            # self.req_pool_indices = torch.unique(self.req_pool_indices)
+            print(f"[COMBINE] self.req_pool_indices: {self.req_pool_indices}")
+            
 
         # Assign updated lists
         self.image_inputs = image_inputs_list if image_inputs_list else None

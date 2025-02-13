@@ -131,29 +131,31 @@ class TpModelWorkerClient:
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
             # Run forward
-            logits_output, next_token_ids = self.worker.forward_batch_generation(
+            logits_output, next_token_ids, forward_batch = self.worker.forward_batch_generation(
                 model_worker_batch, self.launch_done
             )
             print("Run forward batch generation complete")
             print("logits_output: ", logits_output)
             print("next_token_ids: ", next_token_ids)
-
+            # update model_worker_batch with forward_batch
+            model_worker_batch.update_from_forward_batch(forward_batch)
+            
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
             
             
-            # Create random next_token_ids to align the future_token_ids_map (size: row of future_token_ids_map, col of bs)
-            fake_next_token_ids = torch.randint(
-                low=0,
-                high=bs,
-                size=(bs,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            print("Create random next_token_ids to align the future_token_ids_map")
+            # # Create random next_token_ids to align the future_token_ids_map (size: row of future_token_ids_map, col of bs)
+            # fake_next_token_ids = torch.randint(
+            #     low=0,
+            #     high=bs,
+            #     size=(bs,),
+            #     dtype=torch.int32,
+            #     device=self.device,
+            # )
+            # print("Create random next_token_ids to align the future_token_ids_map")
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = fake_next_token_ids
+            ] = next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:

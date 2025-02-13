@@ -390,7 +390,8 @@ class Scheduler:
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                result, model_batch = self.run_batch(batch)
+                batch.update_from_model_worker_batch(model_batch)
                 self.process_batch_result(batch, result)
             else:
                 # Self-check and re-init some states when the server is idle
@@ -411,7 +412,8 @@ class Scheduler:
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
-                result = self.run_batch(batch)
+                result, model_batch = self.run_batch(batch)
+                batch.update_from_model_worker_batch(model_batch)
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
@@ -964,9 +966,10 @@ class Scheduler:
         if self.is_generation:
             model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                logits_output, next_token_ids, forward_batch = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+                model_worker_batch.update_from_forward_batch(forward_batch)
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -986,7 +989,7 @@ class Scheduler:
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = embeddings, model_worker_batch.bid
-        return ret
+        return ret, model_worker_batch
 
     def process_batch_result(self, batch: ScheduleBatch, result):
         if batch.forward_mode.is_decode():

@@ -393,7 +393,7 @@ class MixtralModel(nn.Module):
             hidden_states, _ = self.norm(hidden_states, residual)
             
         print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
-        return hidden_states
+        return hidden_states, forward_batch
 
 
 class MixtralForCausalLM(nn.Module):
@@ -418,10 +418,10 @@ class MixtralForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, complete_token_manager)
+        hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds, complete_token_manager)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        ), forward_batch
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

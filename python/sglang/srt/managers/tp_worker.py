@@ -154,11 +154,11 @@ class TpModelWorker:
         launch_done: Optional[threading.Event] = None,
     ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch)
+        logits_output, forward_batch = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
         next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        return logits_output, next_token_ids
+        return logits_output, next_token_ids, forward_batch
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

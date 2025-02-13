@@ -42,7 +42,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -1116,6 +1116,47 @@ class ScheduleBatch:
             input_embeds=self.input_embeds,
         )
 
+    def update_from_model_worker_batch(self, model_worker_batch):
+        """Update ScheduleBatch attributes from a ModelWorkerBatch."""
+        self.forward_mode = model_worker_batch.forward_mode
+        self.input_ids = model_worker_batch.input_ids
+        self.req_pool_indices = model_worker_batch.req_pool_indices
+        self.seq_lens = model_worker_batch.seq_lens
+        self.out_cache_loc = model_worker_batch.out_cache_loc
+        self.seq_lens_sum = model_worker_batch.seq_lens_sum
+        self.return_logprob = model_worker_batch.return_logprob
+        self.top_logprobs_nums = model_worker_batch.top_logprobs_nums
+        self.global_num_tokens = model_worker_batch.global_num_tokens
+        self.can_run_dp_cuda_graph = model_worker_batch.can_run_dp_cuda_graph
+        self.extend_num_tokens = model_worker_batch.extend_num_tokens
+
+        # if model_worker_batch.extend_seq_lens is not None:
+        #     self.extend_lens = model_worker_batch.extend_seq_lens
+        # if model_worker_batch.extend_prefix_lens is not None:
+        #     self.prefix_lens = model_worker_batch.extend_prefix_lens
+        # if model_worker_batch.extend_logprob_start_lens is not None:
+        #     self.extend_logprob_start_lens = model_worker_batch.extend_logprob_start_lens
+
+        # self.encoder_cached = model_worker_batch.encoder_cached
+        # self.encoder_lens = model_worker_batch.encoder_lens
+        # self.encoder_lens_cpu = model_worker_batch.encoder_lens_cpu
+        # self.encoder_out_cache_loc = model_worker_batch.encoder_out_cache_loc
+        # self.input_embeds = model_worker_batch.input_embeds
+
+        # # Updating request-related information
+        # for req, image_input in zip(self.reqs, model_worker_batch.image_inputs):
+        #     req.image_inputs = image_input
+
+        # for req, lora_path in zip(self.reqs, model_worker_batch.lora_paths):
+        #     req.lora_path = lora_path
+
+        # if model_worker_batch.sampling_info:
+        #     self.sampling_info = model_worker_batch.sampling_info
+
+        # # Updating request-to-token pool records
+        # self.req_to_token_pool.update_from_write_records(model_worker_batch.req_to_token_pool_records)
+
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
@@ -1186,6 +1227,54 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+    
+        
+    def update_from_forward_batch(self, forward_batch: ForwardBatch):
+        changes = []
+
+        def update_attr(attr_name, new_value):
+            old_value = getattr(self, attr_name, None)
+            if isinstance(old_value, torch.Tensor) and isinstance(new_value, torch.Tensor):
+                if not torch.equal(old_value, new_value):
+                    setattr(self, attr_name, new_value)
+                    changes.append(attr_name)
+            elif old_value != new_value:
+                setattr(self, attr_name, new_value)
+                changes.append(attr_name)
+                
+        update_attr("forward_mode", forward_batch.forward_mode)
+        update_attr("input_ids", forward_batch.input_ids)
+        update_attr("req_pool_indices", forward_batch.req_pool_indices)
+        update_attr("seq_lens", forward_batch.seq_lens)
+        update_attr("out_cache_loc", forward_batch.out_cache_loc)
+        update_attr("image_inputs", forward_batch.image_inputs)
+        update_attr("encoder_cached", forward_batch.encoder_cached)
+        update_attr("encoder_lens", forward_batch.encoder_lens)
+        update_attr("encoder_lens_cpu", forward_batch.encoder_lens_cpu)
+        update_attr("encoder_out_cache_loc", forward_batch.encoder_out_cache_loc)
+        update_attr("seq_lens_sum", forward_batch.seq_lens_sum)
+        update_attr("return_logprob", forward_batch.return_logprob)
+        update_attr("top_logprobs_nums", forward_batch.top_logprobs_nums)
+        update_attr("global_num_tokens", forward_batch.global_num_tokens)
+        update_attr("can_run_dp_cuda_graph", forward_batch.can_run_dp_cuda_graph)
+        update_attr("lora_paths", forward_batch.lora_paths)
+        update_attr("sampling_info", forward_batch.sampling_info)
+        update_attr("input_embeds", forward_batch.input_embeds)
+
+        # if not forward_batch.forward_mode.is_decode():
+        #     update_attr("extend_seq_lens", forward_batch.extend_seq_lens_cpu)
+        #     update_attr("extend_prefix_lens", forward_batch.extend_prefix_lens_cpu)
+        #     update_attr("extend_logprob_start_lens", forward_batch.extend_logprob_start_lens_cpu)
+
+        # # Handle LoRA updates if applicable
+        # if forward_batch.model_runner.server_args.lora_paths is not None:
+        #     forward_batch.model_runner.lora_manager.update_lora_batch(self)
+
+        if changes:
+            print(f"Updated attributes: {', '.join(changes)}")
+
+        # Return an updated dataclass instance (preserving immutability if needed)
+        return self
 
 
 @triton.jit

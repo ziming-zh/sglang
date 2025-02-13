@@ -354,9 +354,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         topk_weights_local = topk_weights[~is_remote_toks]
         topk_ids_local = topk_ids[~is_remote_toks]
-        
-        forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
-            
+        if is_decode_mode:
+            forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
+        else:
+            forward_batch_local = forward_batch
+            forward_batch_remote = None
         # print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}, cuda {x_local.device}")
             
         if residual is not None:
