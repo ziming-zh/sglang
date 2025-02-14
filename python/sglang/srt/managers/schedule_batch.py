@@ -1022,6 +1022,13 @@ class ScheduleBatch:
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.seq_lens = None
+            self.out_cache_loc = None
+            self.seq_lens_sum = 0
+            self.output_ids = None
+            self.req_pool_indices = None
+            self.return_logprob = False
+            
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -1056,6 +1063,19 @@ class ScheduleBatch:
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+        if self.reqs is None or len(self.reqs) == 0:
+            self.reqs = other.reqs
+            self.req_pool_indices = other.req_pool_indices
+            self.seq_lens = other.seq_lens
+            self.out_cache_loc = None
+            self.seq_lens_sum = other.seq_lens_sum
+            self.output_ids = other.output_ids
+            self.return_logprob = other.return_logprob
+            self.top_logprobs_nums = other.top_logprobs_nums
+            self.has_stream = other.has_stream
+            self.has_grammar = other.has_grammar
+            return
+        
         if hasattr(other, "sampling_info"):
             self.sampling_info.merge_batch(other.sampling_info)
 
@@ -1066,16 +1086,15 @@ class ScheduleBatch:
                 
         if other.reqs is None or len(other.reqs) == 0:
             return
+        
 
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens]) if self.seq_lens is not None else None
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            if other.output_ids is not None:
-                self.output_ids = torch.concat([self.output_ids, other.output_ids])
+        self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
         elif self.return_logprob:
@@ -1097,6 +1116,7 @@ class ScheduleBatch:
         print(f"[SPLIT_BATCH] req_pool_indices: {self.req_pool_indices}")
         split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
         split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
+        split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
 
         split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
         split_return_logprob = any(req.return_logprob for req in split_reqs)
@@ -1104,13 +1124,13 @@ class ScheduleBatch:
         split_has_stream = any(req.stream for req in split_reqs)
         split_has_grammar = any(req.grammar for req in split_reqs)
         
-        self.filter_batch(keep_indices)
+        self.filter_batch(keep_indices=keep_indices)
         
         return InactiveScheduleBatch(
             reqs=split_reqs,
             req_pool_indices=split_req_pool_indices,
             seq_lens=split_seq_lens,
-            output_ids=None,
+            output_ids=split_output_ids,
             seq_lens_sum=split_seq_lens_sum,
             return_logprob=split_return_logprob,
             top_logprobs_nums=split_top_logprobs_nums,
@@ -1181,6 +1201,8 @@ class ScheduleBatch:
         
         if self.forward_mode.is_decode():
             print("[BEFORE] self.reqs: ", self.reqs)
+            print("[BEFORE] self.seq_lens: ", self.seq_lens)
+            print("[BEFORE] self.output_ids: ", self.output_ids)
             if self.inactive_reqs_batch is not None:
                 print("[BEFORE] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
             # self.rid_list = model_worker_batch.rid_list
@@ -1194,6 +1216,8 @@ class ScheduleBatch:
             
             self.inactive_reqs_batch.merge_batch(cached_inactive_req_batch)
             print("[AFTER] self.reqs: ", self.reqs)
+            print("[AFTER] self.seq_lens: ", self.seq_lens)
+            print("[AFTER] self.output_ids: ", self.output_ids)
             if self.inactive_reqs_batch is not None:
                 print("[AFTER] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
 
@@ -1296,7 +1320,7 @@ class InactiveScheduleBatch:
         
         self.req_pool_indices = torch.concat([self.req_pool_indices, other.req_pool_indices]) if self.req_pool_indices is not None else None
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens]) if self.seq_lens is not None else None
-        self.output_ids = None
+        self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
         self.seq_lens_sum += other.seq_lens_sum
         self.reqs.extend(other.reqs)
         
@@ -1324,6 +1348,7 @@ class InactiveScheduleBatch:
         
         split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
         split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
+        split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
         # split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
         split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
         split_return_logprob = any(req.return_logprob for req in split_reqs)
@@ -1331,13 +1356,13 @@ class InactiveScheduleBatch:
         split_has_stream = any(req.stream for req in split_reqs)
         split_has_grammar = any(req.grammar for req in split_reqs)
         
-        self.filter_batch(keep_indices)
+        self.filter_batch(keep_indices=keep_indices)
         
         return InactiveScheduleBatch(
             reqs=split_reqs,
             req_pool_indices=split_req_pool_indices,
             seq_lens=split_seq_lens,
-            output_ids=None,
+            output_ids=split_output_ids,
             seq_lens_sum=split_seq_lens_sum,
             return_logprob=split_return_logprob,
             top_logprobs_nums=split_top_logprobs_nums,
@@ -1414,6 +1439,12 @@ class ModelWorkerBatch:
             elif old_value != new_value:
                 setattr(self, attr_name, new_value)
                 changes.append(attr_name)
+        
+        print(f"[Before] seq_lens: {self.seq_lens}")
+        # print(f"[Before] input_ids: {self.input_ids}")
+        # print(f"[Before] req_pool_indices: {self.req_pool_indices}")
+        # print(f"[Before] out_cache_loc: {self.out_cache_loc}")
+        print(f"[Before] rid_list: {self.rid_list}")
                 
         update_attr("forward_mode", forward_batch.forward_mode)
         update_attr("input_ids", forward_batch.input_ids)
@@ -1435,6 +1466,11 @@ class ModelWorkerBatch:
         update_attr("input_embeds", forward_batch.input_embeds)
         update_attr("rid_list", forward_batch.rid_list)
 
+        print(f"[After] seq_lens: {self.seq_lens}")
+        # print(f"[After] input_ids: {self.input_ids}")
+        # print(f"[After] req_pool_indices: {self.req_pool_indices}")
+        # print(f"[After] out_cache_loc: {self.out_cache_loc}")
+        print(f"[After] rid_list: {self.rid_list}")
         # if not forward_batch.forward_mode.is_decode():
         #     update_attr("extend_seq_lens", forward_batch.extend_seq_lens_cpu)
         #     update_attr("extend_prefix_lens", forward_batch.extend_prefix_lens_cpu)

@@ -189,18 +189,19 @@ class ForwardBatch:
 
         # Split core tensors
         local_batch.input_ids, remote_batch.input_ids = split_tensor(self.input_ids)
-        local_batch.seq_lens = local_mask.sum(dim=-1, keepdim=True)
-        remote_batch.seq_lens = remote_mask.sum(dim=-1, keepdim=True)
-        
-        local_batch.seq_lens_sum = local_batch.seq_lens.sum().item()
-        remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item()
         
         local_batch.positions, remote_batch.positions = split_tensor(self.positions)
         local_batch.out_cache_loc, remote_batch.out_cache_loc = split_tensor(self.out_cache_loc)
+        local_batch.encoder_out_cache_loc, remote_batch.encoder_out_cache_loc = split_tensor(self.encoder_out_cache_loc)
         print("[SPLIT] local_batch.out_cache_loc: ", local_batch.out_cache_loc)
         print("[SPLIT] remote_batch.out_cache_loc: ", remote_batch.out_cache_loc)
-        local_batch.encoder_out_cache_loc, remote_batch.encoder_out_cache_loc = split_tensor(self.encoder_out_cache_loc)
 
+        
+        local_batch.seq_lens, remote_batch.seq_lens = split_tensor(self.seq_lens)
+        print("[SPLIT] local_batch.seq_lens: ", local_batch.seq_lens)
+        print("[SPLIT] remote_batch.seq_lens: ", remote_batch.seq_lens)
+        local_batch.seq_lens_sum = local_batch.seq_lens.sum().item()
+        remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item()
         # Split other metadata
         # local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
         # remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
@@ -247,10 +248,13 @@ class ForwardBatch:
         # Collect tensors and lists from all batches
         def is_valid_tensor(t):
             return t is not None and t.numel() > 0
+        
+        def is_valid_seq_len(t):
+            return t is not None and (t.numel() > 1 or (t.numel() > 0 and t.item() != 0))
 
         # Collect tensors and lists from all batches
         input_ids_list = [self.input_ids] if is_valid_tensor(self.input_ids) else []
-        seq_lens_list = [self.seq_lens] if is_valid_tensor(self.seq_lens) else []
+        seq_lens_list = [self.seq_lens] if is_valid_seq_len(self.seq_lens) else []
         positions_list = [self.positions] if is_valid_tensor(self.positions) else []
         out_cache_loc_list = [self.out_cache_loc] if is_valid_tensor(self.out_cache_loc) else []
         encoder_out_cache_loc_list = [self.encoder_out_cache_loc] if is_valid_tensor(self.encoder_out_cache_loc) else []
@@ -261,15 +265,15 @@ class ForwardBatch:
         rid_list = self.rid_list if self.rid_list is not None else []
 
         for other in fb_list:
-            if other.input_ids is not None:
+            if is_valid_tensor(other.input_ids):
                 input_ids_list.append(other.input_ids)
-            if other.seq_lens is not None:
+            if is_valid_seq_len(other.seq_lens):
                 seq_lens_list.append(other.seq_lens)
-            if other.positions is not None:
+            if is_valid_tensor(other.positions):
                 positions_list.append(other.positions)
-            if other.out_cache_loc is not None:
+            if is_valid_tensor(other.out_cache_loc):
                 out_cache_loc_list.append(other.out_cache_loc)
-            if other.encoder_out_cache_loc is not None:
+            if is_valid_tensor(other.encoder_out_cache_loc):
                 encoder_out_cache_loc_list.append(other.encoder_out_cache_loc)
 
             if other.image_inputs is not None:
@@ -306,7 +310,7 @@ class ForwardBatch:
         print(f"seq_lens_list: {seq_lens_list} len: {len(seq_lens_list)}")
         # add seq_len up in seq_lens_list
         
-        self.seq_lens = torch.tensor([sum(t.item() for t in seq_lens_list)],device=self.seq_lens.device)
+        self.seq_lens = seq_lens_list[0] if len(seq_lens_list) == 1 else torch.cat(seq_lens_list, dim=0) if seq_lens_list else None
         print(f"self.seq_lens: {self.seq_lens}")
         print(f"positions_list: {positions_list} len: {len(positions_list)}")
         self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
