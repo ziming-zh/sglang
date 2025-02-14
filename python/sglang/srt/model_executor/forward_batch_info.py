@@ -149,6 +149,9 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
     
+    # Decoding: rid_list
+    rid_list: Optional[List[str]] = None
+    
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -173,8 +176,8 @@ class ForwardBatch:
                     tensor[remote_mask].clone() if tensor is not None else None)
 
         def split_list(lst: Optional[List]):
-            return ([lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None,
-                    [lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None)
+            return ([lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None,
+                    [lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None)
 
 
         
@@ -222,6 +225,11 @@ class ForwardBatch:
         # Compute new batch sizes
         local_batch.batch_size = local_batch.input_ids.shape[0] if local_batch.input_ids is not None else 0
         remote_batch.batch_size = remote_batch.input_ids.shape[0] if remote_batch.input_ids is not None else 0
+        
+        # split rid_list
+        local_batch.rid_list, remote_batch.rid_list = split_list(self.rid_list)
+        print(f"[SPLIT] local_batch.rid_list: {local_batch.rid_list}")
+        print(f"[SPLIT] remote_batch.rid_list: {remote_batch.rid_list}")
 
         return local_batch, remote_batch
 
@@ -250,6 +258,7 @@ class ForwardBatch:
         print(f"seq_lens_list: {seq_lens_list}")
         image_inputs_list = self.image_inputs if self.image_inputs is not None else []
         lora_paths_list = self.lora_paths if self.lora_paths is not None else []
+        rid_list = self.rid_list if self.rid_list is not None else []
 
         for other in fb_list:
             if other.input_ids is not None:
@@ -270,6 +279,9 @@ class ForwardBatch:
             
             if other.req_pool_indices is not None:
                 req_pool_indices_list.append(other.req_pool_indices)
+                
+            if other.rid_list is not None:
+                rid_list.extend(other.rid_list)
 
             self.seq_lens_sum += other.seq_lens_sum
             self.batch_size += other.batch_size
@@ -287,31 +299,35 @@ class ForwardBatch:
             # Update attention backend
             self.attn_backend = other.attn_backend  # Reference update
 
-            # Concatenate tensors in one operation, or use the single element if list length is 1
-            print(f"input_ids_list: {input_ids_list} len: {len(input_ids_list)}")
-            self.input_ids = input_ids_list[0] if len(input_ids_list) == 1 else torch.cat(input_ids_list, dim=0) if input_ids_list else None
-            print(f"self.input_ids: {self.input_ids}")
-            print(f"seq_lens_list: {seq_lens_list} len: {len(seq_lens_list)}")
-            # add seq_len up in seq_lens_list
-            
-            self.seq_lens = torch.tensor([sum(t.item() for t in seq_lens_list)],device=self.seq_lens.device)
-            print(f"self.seq_lens: {self.seq_lens}")
-            print(f"positions_list: {positions_list} len: {len(positions_list)}")
-            self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
-            print(f"self.positions: {self.positions}")
-            print("[BEFORE COMBINE] self.out_cache_loc: ", self.out_cache_loc)
-            self.out_cache_loc = out_cache_loc_list[0] if len(out_cache_loc_list) == 1 else torch.cat(out_cache_loc_list, dim=0) if out_cache_loc_list else None
-            print("[COMBINE] self.out_cache_loc: ", self.out_cache_loc)
-            self.encoder_out_cache_loc = (
-                encoder_out_cache_loc_list[0] if len(encoder_out_cache_loc_list) == 1 else torch.cat(encoder_out_cache_loc_list, dim=0)
-                if encoder_out_cache_loc_list else None
-            )
-            
-            print(f"[BEFORE COMBINE] self.req_pool_indices: {self.req_pool_indices}")
-            self.req_pool_indices = req_pool_indices_list[0] if len(req_pool_indices_list) == 1 else torch.cat(req_pool_indices_list, dim=0) if req_pool_indices_list else None
-            # self.req_pool_indices = torch.unique(self.req_pool_indices)
-            print(f"[COMBINE] self.req_pool_indices: {self.req_pool_indices}")
-            
+        # Concatenate tensors in one operation, or use the single element if list length is 1
+        print(f"input_ids_list: {input_ids_list} len: {len(input_ids_list)}")
+        self.input_ids = input_ids_list[0] if len(input_ids_list) == 1 else torch.cat(input_ids_list, dim=0) if input_ids_list else None
+        print(f"self.input_ids: {self.input_ids}")
+        print(f"seq_lens_list: {seq_lens_list} len: {len(seq_lens_list)}")
+        # add seq_len up in seq_lens_list
+        
+        self.seq_lens = torch.tensor([sum(t.item() for t in seq_lens_list)],device=self.seq_lens.device)
+        print(f"self.seq_lens: {self.seq_lens}")
+        print(f"positions_list: {positions_list} len: {len(positions_list)}")
+        self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
+        print(f"self.positions: {self.positions}")
+        print("[BEFORE COMBINE] self.out_cache_loc: ", self.out_cache_loc)
+        self.out_cache_loc = out_cache_loc_list[0] if len(out_cache_loc_list) == 1 else torch.cat(out_cache_loc_list, dim=0) if out_cache_loc_list else None
+        print("[COMBINE] self.out_cache_loc: ", self.out_cache_loc)
+        self.encoder_out_cache_loc = (
+            encoder_out_cache_loc_list[0] if len(encoder_out_cache_loc_list) == 1 else torch.cat(encoder_out_cache_loc_list, dim=0)
+            if encoder_out_cache_loc_list else None
+        )
+        
+        print(f"[BEFORE COMBINE] self.req_pool_indices: {self.req_pool_indices}")
+        self.req_pool_indices = req_pool_indices_list[0] if len(req_pool_indices_list) == 1 else torch.cat(req_pool_indices_list, dim=0) if req_pool_indices_list else None
+        # self.req_pool_indices = torch.unique(self.req_pool_indices)
+        print(f"[COMBINE] self.req_pool_indices: {self.req_pool_indices}")
+        
+        print(f"[BEFORE COMBINE] self.rid_list: {self.rid_list}")
+        self.rid_list = rid_list
+        print(f"[COMBINE] self.rid_list: {self.rid_list}")
+        
 
         # Assign updated lists
         self.image_inputs = image_inputs_list if image_inputs_list else None
@@ -406,6 +422,7 @@ class ForwardBatch:
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             input_embeds=batch.input_embeds,
+            rid_list=batch.rid_list,
         )
 
         if ret.global_num_tokens is not None:
