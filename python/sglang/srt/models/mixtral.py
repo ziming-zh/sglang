@@ -387,7 +387,7 @@ class MixtralModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual, forward_batch = layer(
-                positions, hidden_states, forward_batch, residual, complete_token_manager=complete_token_manager
+                forward_batch.positions, hidden_states, forward_batch, residual, complete_token_manager=complete_token_manager
             )
         if hidden_states.numel() > 0:
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -418,9 +418,11 @@ class MixtralForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ) -> torch.Tensor:
+        print(f"[MixtralForCausalLM]Forward batch input_ids: {input_ids}")
+        assert input_ids.storage() is not None, "Input has no storage."
         hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds, complete_token_manager)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            forward_batch.input_ids, hidden_states, self.lm_head, forward_batch
         ), forward_batch
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

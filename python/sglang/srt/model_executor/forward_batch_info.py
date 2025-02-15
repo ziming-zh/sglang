@@ -263,7 +263,7 @@ class ForwardBatch:
         image_inputs_list = self.image_inputs if self.image_inputs is not None else []
         lora_paths_list = self.lora_paths if self.lora_paths is not None else []
         rid_list = self.rid_list if self.rid_list is not None else []
-
+        print(f"[BEFORE COMBINE] self.rid_list: {self.rid_list}")
         for other in fb_list:
             if is_valid_tensor(other.input_ids):
                 input_ids_list.append(other.input_ids)
@@ -328,7 +328,7 @@ class ForwardBatch:
         # self.req_pool_indices = torch.unique(self.req_pool_indices)
         print(f"[COMBINE] self.req_pool_indices: {self.req_pool_indices}")
         
-        print(f"[BEFORE COMBINE] self.rid_list: {self.rid_list}")
+        
         self.rid_list = rid_list
         print(f"[COMBINE] self.rid_list: {self.rid_list}")
         
