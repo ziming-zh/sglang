@@ -1011,6 +1011,7 @@ class ScheduleBatch:
         self,
         being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
+        keep_output_ids: bool = False,
     ):
         if keep_indices is None:
             keep_indices = [
@@ -1047,7 +1048,8 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[new_indices]
+        if not keep_output_ids:
+            self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -1116,7 +1118,7 @@ class ScheduleBatch:
         print(f"[SPLIT_BATCH] req_pool_indices: {self.req_pool_indices}")
         split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
         split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
-        split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
+        # split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
 
         split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
         split_return_logprob = any(req.return_logprob for req in split_reqs)
@@ -1124,13 +1126,13 @@ class ScheduleBatch:
         split_has_stream = any(req.stream for req in split_reqs)
         split_has_grammar = any(req.grammar for req in split_reqs)
         
-        self.filter_batch(keep_indices=keep_indices)
+        self.filter_batch(keep_indices=keep_indices, keep_output_ids=True)
         
         return InactiveScheduleBatch(
             reqs=split_reqs,
             req_pool_indices=split_req_pool_indices,
             seq_lens=split_seq_lens,
-            output_ids=split_output_ids,
+            output_ids=None,
             seq_lens_sum=split_seq_lens_sum,
             return_logprob=split_return_logprob,
             top_logprobs_nums=split_top_logprobs_nums,
@@ -1296,8 +1298,6 @@ class InactiveScheduleBatch:
         if self.seq_lens is not None:
             self.seq_lens = self.seq_lens[new_indices]
             self.seq_lens_sum = self.seq_lens.sum().item()
-        if self.output_ids is not None:
-            self.output_ids = self.output_ids[new_indices]
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
 
@@ -1310,7 +1310,7 @@ class InactiveScheduleBatch:
             self.reqs = other.reqs
             self.req_pool_indices = other.req_pool_indices
             self.seq_lens = other.seq_lens
-            self.output_ids = other.output_ids
+            # self.output_ids = other.output_ids
             self.seq_lens_sum = other.seq_lens_sum
             self.return_logprob = other.return_logprob
             self.top_logprobs_nums = other.top_logprobs_nums
@@ -1320,7 +1320,7 @@ class InactiveScheduleBatch:
         
         self.req_pool_indices = torch.concat([self.req_pool_indices, other.req_pool_indices]) if self.req_pool_indices is not None else None
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens]) if self.seq_lens is not None else None
-        self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
+        # self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
         self.seq_lens_sum += other.seq_lens_sum
         self.reqs.extend(other.reqs)
         
@@ -1348,7 +1348,6 @@ class InactiveScheduleBatch:
         
         split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
         split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
-        split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
         # split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
         split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
         split_return_logprob = any(req.return_logprob for req in split_reqs)
@@ -1362,7 +1361,7 @@ class InactiveScheduleBatch:
             reqs=split_reqs,
             req_pool_indices=split_req_pool_indices,
             seq_lens=split_seq_lens,
-            output_ids=split_output_ids,
+            output_ids=None,
             seq_lens_sum=split_seq_lens_sum,
             return_logprob=split_return_logprob,
             top_logprobs_nums=split_top_logprobs_nums,
