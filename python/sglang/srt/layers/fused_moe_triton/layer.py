@@ -70,14 +70,14 @@ def cpu_offload_worker(task_queue, result_queue_list, w13_cpu, w2_cpu):
     """
     while True:
         # try:
-        print(f"Worker process waiting for task")
+        # print(f"Worker process waiting for task")
         task = task_queue.get()
         if task is None:
-            print("Received stop signal, exiting worker process")
+            # print("Received stop signal, exiting worker process")
             break  # Stop the worker when None is received
 
         task_id, layer_id, x_remote_cpu, topk_weights_remote_cpu, topk_ids_remote_cpu, complete_token_manager = task
-        print(f"[Offload Worker] task {task_id} received at time {time.time()}")
+        # print(f"[Offload Worker] task {task_id} received at time {time.time()}")
         # Perform CPU computation
         cpu_result = fused_experts_cpu_impl(
             hidden_states=x_remote_cpu,
@@ -90,9 +90,10 @@ def cpu_offload_worker(task_queue, result_queue_list, w13_cpu, w2_cpu):
         # Store the result in a shared queue
         result_queue = result_queue_list[layer_id]
         if result_queue.full():
-            print(f"Result queue is full, failed to put task {task_id}")
+            # print(f"Result queue is full, failed to put task {task_id}")
+            pass
         else:
-            print(f"Offload task {task_id} completed at time {time.time()}")
+            # print(f"Offload task {task_id} completed at time {time.time()}")
             result_queue.put((task_id, cpu_result))
             complete_token_manager.update_token(task_id, layer_id)
                 
@@ -464,11 +465,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # print(f"[Combine before] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
                 forward_batch_local.combine(fetched_forward_batch)
                 # print(f"[Combine after] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
+                # synchronize streams
+                torch.cuda.synchronize()
                     
             # print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
             # print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
             
-            forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
+            # forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
             # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
 
         return x_local, residual_local, forward_batch_local

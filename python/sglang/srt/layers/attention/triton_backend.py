@@ -47,18 +47,22 @@ class TritonAttnBackend(AttentionBackend):
         self.device = model_runner.device
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
-
+        """Init auxiliary variables for Triton attention backend."""
+        
         if forward_batch.forward_mode.is_decode():
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
-            total_num_tokens = forward_batch.seq_lens_sum
-            attn_logits = torch.empty(
-                (self.num_head, total_num_tokens),
+            # Allocate a larger buffer than needed (e.g., 1.5x the maximum expected)
+            max_expected_tokens = int(1.5 * forward_batch.seq_lens_sum)
+            self.attn_logits_buffer = torch.empty(
+                (self.num_head, max_expected_tokens),
                 dtype=self.reduce_dtype,
                 device=self.device,
             )
+
+            total_num_tokens = forward_batch.seq_lens_sum
+            attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Slice for this batch
 
             max_seq_len = torch.max(forward_batch.seq_lens).item()
             max_extend_len = None
@@ -67,6 +71,27 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+
+            
+    def update_forward_metadata(self, forward_batch: ForwardBatch):
+        """Update auxiliary variables for Triton attention backend."""
+
+        if forward_batch.forward_mode.is_decode():
+            start_loc, _, max_seq_len, _ = self.forward_metadata
+            start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
+            start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
+
+            total_num_tokens = forward_batch.seq_lens_sum
+            attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Reuse buffer
+
+            max_seq_len = torch.max(forward_batch.seq_lens).item()
+            max_extend_len = None
+        else:
+            start_loc, attn_logits, max_seq_len, _ = self.forward_metadata
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+
+        self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
@@ -172,7 +197,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        # self.init_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
+        self.update_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         if save_kv_cache:

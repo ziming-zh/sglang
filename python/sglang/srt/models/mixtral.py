@@ -130,7 +130,6 @@ class MixtralMoE(nn.Module):
         if self.tp_size > 1:
             if is_decode_mode:
                 print(f"[Testing]Final hidden states shape: {final_hidden_states.shape}")
-                print(f"[Testing]Forward batch is_local_toks: {forward_batch.is_local_toks}")
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -180,6 +179,7 @@ class MixtralAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.layer_id = layer_id
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -222,19 +222,24 @@ class MixtralAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         # print(f"[MIXTRAL qkv_proj]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        try:
+            print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        except Exception as e:
+            print(f"[MIXTRAL qkv split] Layer id: {self.layer_id}, Error: {e}")
         # print("Position storage after clone:", positions.storage().data_ptr())
         # check the size of q, k before and after rotary_emb
         # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape before rotary_emb: {k.shape}")
-        
         q, k = self.rotary_emb(positions, q, k)
         
         # print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
         # print("Query storage:", q.storage().data_ptr())
         # print("Key storage:", k.storage().data_ptr())
-        print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        try:
+            print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        except Exception as e:
+            print(f"[MIXTRAL Attention] Layer id: {self.layer_id}, Error: {e}")
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output

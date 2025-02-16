@@ -658,16 +658,66 @@ def decode_attention_fwd_grouped(
         "logit_cap": logit_cap,
     }
 
-    # # Print argument information
-    # for name, arg in args.items():
-    #     try:
-    #         if isinstance(arg, torch.Tensor):
-    #             print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
-    #         else:
-    #             print(f"{name}: type={type(arg)}, value={arg}")
-    #     except Exception as e:
-    #         print(f"Exception {name}: {e}")
-    #         raise e
+    # Print argument information
+    for name, arg in args.items():
+        try:
+            if isinstance(arg, torch.Tensor):
+                print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
+            else:
+                print(f"{name}: type={type(arg)}, value={arg}")
+        except Exception as e:
+            print(f"Exception {name}: {e}")
+            raise e
+
+
+    # Ensure all inputs are valid tensors and not empty
+    for name, tensor in {
+        "attn_logits": attn_logits,
+        "v_buffer": v_buffer,
+        "o": o,
+        "req_to_token": req_to_token,
+        "b_req_idx": b_req_idx,
+        "b_start_loc": b_start_loc,
+        "b_seq_len": b_seq_len,
+    }.items():
+        assert isinstance(tensor, torch.Tensor), f"Error: {name} is not a tensor, but {type(tensor)}."
+        assert tensor.numel() > 0, f"Error: {name} is an empty tensor."
+
+    # Extract dimensions
+    batch, head_num = b_seq_len.shape[0], attn_logits.shape[0]
+    kv_group_num = attn_logits.shape[0] // v_buffer.shape[1]
+    Lv = v_buffer.shape[-1]
+
+    # Ensure expected tensor ranks (dimensionality checks)
+    assert attn_logits.ndim == 2, f"Error: attn_logits should have 4 dimensions (batch, heads, seq, kv), but got shape {attn_logits.shape}."
+    assert v_buffer.ndim == 3, f"Error: v_buffer should have 3 dimensions (batch, kv_groups, d_model), but got shape {v_buffer.shape}."
+    assert o.ndim == 3, f"Error: o should have 3 dimensions (batch, heads, d_model), but got shape {o.shape}."
+    assert req_to_token.ndim == 2, f"Error: req_to_tokens should have 2 dimensions (batch, seq_len), but got shape {req_to_token.shape}."
+    assert b_req_idx.ndim == 1, f"Error: b_req_idx should have 1 dimension (batch), but got shape {b_req_idx.shape}."
+    assert b_start_loc.ndim == 1, f"Error: b_start_loc should have 1 dimension (batch), but got shape {b_start_loc.shape}."
+    assert b_seq_len.ndim == 1, f"Error: b_seq_len should have 1 dimension (batch), but got shape {b_seq_len.shape}."
+
+    # Ensure shape consistency
+    assert attn_logits.shape[0] == v_buffer.shape[1] * kv_group_num, (
+        f"Error: Inconsistent head count in attn_logits and v_buffer. Expected attn_logits.shape[0] ({attn_logits.shape[0]}) "
+        f"to be v_buffer.shape[1] * kv_group_num ({v_buffer.shape[1]} * {kv_group_num} = {v_buffer.shape[1] * kv_group_num})."
+    )
+
+    assert b_seq_len.shape[0] == batch, (
+        f"Error: b_seq_len shape mismatch. Expected {batch}, but got {b_seq_len.shape[0]}."
+    )
+
+    assert b_req_idx.shape[0] == b_start_loc.shape[0] == b_seq_len.shape[0], (
+        f"Error: Mismatched batch sizes across req_to_tokens ({req_to_token.shape[0]}), "
+        f"b_req_idx ({b_req_idx.shape[0]}), b_start_loc ({b_start_loc.shape[0]}), and b_seq_len ({b_seq_len.shape[0]})."
+    )
+
+    assert v_buffer.shape[-1] == Lv, (
+        f"Error: v_buffer last dimension mismatch. Expected {Lv}, but got {v_buffer.shape[-1]}."
+    )
+
+    # Ensure kv_group_num is valid
+    assert kv_group_num > 0, f"Error: Computed kv_group_num ({kv_group_num}) is invalid. Check logits and v_buffer shapes."
 
     # Call Triton kernel with the corrected arguments
     _decode_grouped_att_m_fwd(
@@ -682,7 +732,7 @@ def decode_attention_fwd_grouped(
         args["sm_scale"],
         args["logit_cap"],
     )
-
+    
     _decode_grouped_softmax_reducev_fwd(
         attn_logits,
         v_buffer,

@@ -1288,7 +1288,7 @@ class CompleteTokenQueryService:
                 layer_compute_cnt[token] += 1
             else:
                 layer_compute_cnt[token] = 1
-            print(f"Token {token} updated in Layer {layer_id}: {layer_compute_cnt[token]}")
+            # print(f"Token {token} updated in Layer {layer_id}: {layer_compute_cnt[token]}")
 
     def query(self, round_id, layer_id):
         """Query completed tokens for a specific layer_id key."""
@@ -1297,7 +1297,7 @@ class CompleteTokenQueryService:
         with self.lock:
             # Cache hit: Return stored result
             if self.cache_key.get(layer_id) == key:
-                print(f"Cache hit for layer {layer_id}: {self.cache_value[layer_id]}")
+                # print(f"Cache hit for layer {layer_id}: {self.cache_value[layer_id]}")
                 return list(self.cache_value[layer_id])  # Convert to list for safety
 
             finished_tokens = []
@@ -1306,12 +1306,12 @@ class CompleteTokenQueryService:
             for token, count in list(layer_compute_cnt.items()):  # Use list() to avoid runtime error
                 if count == self.tp_rank_range:
                     finished_tokens.append(token)
-                    print(f"Token {token} finished in Layer {layer_id}: {count}")
+                    # print(f"Token {token} finished in Layer {layer_id}: {count}")
                     # Delete the token from the compute count
                     del layer_compute_cnt[token]
 
             # if len(finished_tokens) > 0:
-            print(f"Cache miss for layer {layer_id}: {finished_tokens}")
+            # print(f"Cache miss for layer {layer_id}: {finished_tokens}")
 
             # Update cache entry for the layer
             self.cache_key[layer_id] = key
