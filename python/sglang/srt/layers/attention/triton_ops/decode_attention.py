@@ -658,16 +658,16 @@ def decode_attention_fwd_grouped(
         "logit_cap": logit_cap,
     }
 
-    # Print argument information
-    for name, arg in args.items():
-        try:
-            if isinstance(arg, torch.Tensor):
-                print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
-            else:
-                print(f"{name}: type={type(arg)}, value={arg}")
-        except Exception as e:
-            print(f"Exception {name}: {e}")
-            raise e
+    # # Print argument information
+    # for name, arg in args.items():
+    #     try:
+    #         if isinstance(arg, torch.Tensor):
+    #             print(f"{name}: type={type(arg)}, device={arg.device}, shape={arg.shape}")
+    #         else:
+    #             print(f"{name}: type={type(arg)}, value={arg}")
+    #     except Exception as e:
+    #         print(f"Exception {name}: {e}")
+    #         raise e
 
 
     # Ensure all inputs are valid tensors and not empty
