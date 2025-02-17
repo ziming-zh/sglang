@@ -447,8 +447,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 try:
                     cpu_result = self.cpu_buffer[key]
                 except KeyError as e:
-                    print(f"Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
-                    raise e
+                    assert False, (f"Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
                 print(f"[Task {key}] finished at {time.time()}")
                 # with torch.cuda.stream(self.stream_gpu):
                 gpu_result = cpu_result[0].to(device, non_blocking=True)
@@ -546,48 +545,49 @@ def fused_experts_cpu_impl(
         (num_tokens, output_size), device="cpu", dtype=hidden_states.dtype
     )
     
-    # Iterate over tokens to compute MoE outputs
-    for token_idx in range(num_tokens):
-        token_embedding = hidden_states[token_idx]  # [hidden_size]
-        token_output = torch.zeros(output_size, device=hidden_states.device, dtype=hidden_states.dtype)
+    # # Iterate over tokens to compute MoE outputs
+    # for token_idx in range(num_tokens):
+    #     token_embedding = hidden_states[token_idx]  # [hidden_size]
+    #     token_output = torch.zeros(output_size, device=hidden_states.device, dtype=hidden_states.dtype)
         
-        for expert_rank in range(k):
-            expert_id = topk_ids[token_idx, expert_rank].item()%4  # temp: only 4 experts available
-            expert_weight = topk_weights[token_idx, expert_rank].item()
+    #     for expert_rank in range(k):
+    #         expert_id = topk_ids[token_idx, expert_rank].item()%4  # temp: only 4 experts available
+    #         expert_weight = topk_weights[token_idx, expert_rank].item()
             
-            # Fetch expert weights from w13 (merged w1 and w3)
-            w1_expert, w3_expert = torch.chunk(w13[expert_id], 2, dim=0)  # [N, hidden_size] each
-            w2_expert = w2[expert_id]  # [N, output_size]
+    #         # Fetch expert weights from w13 (merged w1 and w3)
+    #         w1_expert, w3_expert = torch.chunk(w13[expert_id], 2, dim=0)  # [N, hidden_size] each
+    #         w2_expert = w2[expert_id]  # [N, output_size]
 
-            # print(f"w1_expert: {w1_expert.shape}, w3_expert: {w3_expert.shape}")
-            # print(f"w2_expert: {w2_expert.shape}")
+    #         # print(f"w1_expert: {w1_expert.shape}, w3_expert: {w3_expert.shape}")
+    #         # print(f"w2_expert: {w2_expert.shape}")
 
-            # Compute expert output using GLU mechanism
-            intermediate1 = torch.matmul(token_embedding, w1_expert.T)  # [N]
-            intermediate2 = torch.matmul(token_embedding, w3_expert.T)  # [N]
+    #         # Compute expert output using GLU mechanism
+    #         intermediate1 = torch.matmul(token_embedding, w1_expert.T)  # [N]
+    #         intermediate2 = torch.matmul(token_embedding, w3_expert.T)  # [N]
             
-            # print(f"intermediate1: {intermediate1.shape}, intermediate2: {intermediate2.shape}")
+    #         # print(f"intermediate1: {intermediate1.shape}, intermediate2: {intermediate2.shape}")
 
-            # Apply SiLU activation and gate using w3
-            activated = torch.nn.functional.silu(intermediate1) * intermediate2  
+    #         # Apply SiLU activation and gate using w3
+    #         activated = torch.nn.functional.silu(intermediate1) * intermediate2  
             
-            # print(f"activated: {activated.shape}")
+    #         # print(f"activated: {activated.shape}")
 
-            # Compute final expert output
-            expert_output = torch.matmul(activated, w2_expert.T)  # [output_size]
+    #         # Compute final expert output
+    #         expert_output = torch.matmul(activated, w2_expert.T)  # [output_size]
             
-            # print(f"expert_output: {expert_output.shape}")
+    #         # print(f"expert_output: {expert_output.shape}")
             
-            # print(f"token_output: {token_output.shape}")
+    #         # print(f"token_output: {token_output.shape}")
             
-            # print(f"expert_weight: {expert_weight}")
+    #         # print(f"expert_weight: {expert_weight}")
 
-            # Weighted sum across experts
-            token_output += expert_output * expert_weight
+    #         # Weighted sum across experts
+    #         token_output += expert_output * expert_weight
 
         
-        # Store the token's output
-        out_hidden_states[token_idx] = token_output
+    #     # Store the token's output
+    #     out_hidden_states[token_idx] = token_output
+    time.sleep(0.03)
     
     return out_hidden_states
 
