@@ -451,8 +451,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     raise e
                 print(f"[Task {key}] finished at {time.time()}")
                 # with torch.cuda.stream(self.stream_gpu):
-                gpu_result = cpu_result[0].to(device)
-                residual_gpu = cpu_result[1].to(device) if cpu_result[1] is not None else None
+                gpu_result = cpu_result[0].to(device, non_blocking=True)
+                residual_gpu = cpu_result[1].to(device, non_blocking=True) if cpu_result[1] is not None else None
                 forward_batch_remote = cpu_result[2]
                 fetched_cpu_results.append(gpu_result)
                 fetched_residuals.append(residual_gpu)
