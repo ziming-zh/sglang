@@ -54,7 +54,7 @@ class TritonAttnBackend(AttentionBackend):
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
             # Allocate a larger buffer than needed (e.g., 1.5x the maximum expected)
-            max_expected_tokens = int(1.5 * forward_batch.seq_lens_sum)
+            max_expected_tokens = int(2 * forward_batch.seq_lens_sum)
             self.attn_logits_buffer = torch.empty(
                 (self.num_head, max_expected_tokens),
                 dtype=self.reduce_dtype,
@@ -82,6 +82,14 @@ class TritonAttnBackend(AttentionBackend):
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
             total_num_tokens = forward_batch.seq_lens_sum
+            # assert total_num_tokens <= self.attn_logits_buffer.shape[1], f"total_num_tokens: {total_num_tokens}, attn_logits_buffer.shape[1]: {self.attn_logits_buffer.shape[1]}"
+            if total_num_tokens > self.attn_logits_buffer.shape[1]:
+                self.attn_logits_buffer = torch.empty(
+                    (self.num_head, total_num_tokens),
+                    dtype=self.reduce_dtype,
+                    device=self.device,
+                )
+            assert total_num_tokens > 0, f"total_num_tokens: {total_num_tokens}"
             attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Reuse buffer
 
             max_seq_len = torch.max(forward_batch.seq_lens).item()
