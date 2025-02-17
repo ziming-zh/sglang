@@ -1148,7 +1148,7 @@ class RowParallelLinear(LinearBase):
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         print("[RowParallelLinear all_reduce] output", output.shape, output_parallel.device)
         output_bias = self.bias if self.skip_bias_add else None
 

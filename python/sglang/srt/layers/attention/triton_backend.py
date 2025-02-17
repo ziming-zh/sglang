@@ -47,18 +47,22 @@ class TritonAttnBackend(AttentionBackend):
         self.device = model_runner.device
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init auxiliary variables for triton attention backend."""
-
+        """Init auxiliary variables for Triton attention backend."""
+        
         if forward_batch.forward_mode.is_decode():
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
-            total_num_tokens = forward_batch.seq_lens_sum
-            attn_logits = torch.empty(
-                (self.num_head, total_num_tokens),
+            # Allocate a larger buffer than needed (e.g., 1.5x the maximum expected)
+            max_expected_tokens = int(2 * forward_batch.seq_lens_sum)
+            self.attn_logits_buffer = torch.empty(
+                (self.num_head, max_expected_tokens),
                 dtype=self.reduce_dtype,
                 device=self.device,
             )
+
+            total_num_tokens = forward_batch.seq_lens_sum
+            attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Slice for this batch
 
             max_seq_len = torch.max(forward_batch.seq_lens).item()
             max_extend_len = None
@@ -67,6 +71,35 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+
+            
+    def update_forward_metadata(self, forward_batch: ForwardBatch):
+        """Update auxiliary variables for Triton attention backend."""
+
+        if forward_batch.forward_mode.is_decode():
+            start_loc, _, max_seq_len, _ = self.forward_metadata
+            start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
+            start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
+
+            total_num_tokens = forward_batch.seq_lens_sum
+            # assert total_num_tokens <= self.attn_logits_buffer.shape[1], f"total_num_tokens: {total_num_tokens}, attn_logits_buffer.shape[1]: {self.attn_logits_buffer.shape[1]}"
+            if total_num_tokens > self.attn_logits_buffer.shape[1]:
+                self.attn_logits_buffer = torch.empty(
+                    (self.num_head, total_num_tokens),
+                    dtype=self.reduce_dtype,
+                    device=self.device,
+                )
+            assert total_num_tokens > 0, f"total_num_tokens: {total_num_tokens}"
+            attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Reuse buffer
+
+            max_seq_len = torch.max(forward_batch.seq_lens).item()
+            max_extend_len = None
+        else:
+            start_loc, attn_logits, max_seq_len, _ = self.forward_metadata
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+
+        self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+
 
     def init_cuda_graph_state(self, max_bs: int):
         self.cuda_graph_max_total_num_tokens = max_bs * self.cuda_graph_max_seq_len
@@ -134,7 +167,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
-        print("Triton backend forward_extend: forward_batch", forward_batch)
+        # print("Triton backend forward_extend: forward_batch", forward_batch)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -172,14 +205,16 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        self.update_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         if save_kv_cache:
-            print("[Triton backend] forward_decode: forward_batch", forward_batch)
+            # print("[Triton backend] forward_decode: forward_batch", forward_batch)
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-
+        # print(f"[Triton backend cuda {self.device}] forward_decode: forward_batch", forward_batch)
+        # print(f"[Triton backend cuda {self.device}] forward_decode: start_loc", start_loc)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),

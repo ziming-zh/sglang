@@ -81,7 +81,6 @@ class ForwardMode(IntEnum):
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
 
-
 @dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
@@ -149,6 +148,9 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
     
+    # Decoding: rid_list
+    rid_list: Optional[List[str]] = None
+    
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -169,12 +171,18 @@ class ForwardBatch:
         local_mask = ~remote_mask
 
         def split_tensor(tensor: Optional[torch.Tensor]):
-            return (tensor[local_mask].clone() if tensor is not None else None,
-                    tensor[remote_mask].clone() if tensor is not None else None)
+            if tensor is None:
+                return None, None
+            local_tensor = tensor[local_mask].clone() if local_mask.any() else None
+            remote_tensor = tensor[remote_mask].clone() if remote_mask.any() else None
+            return local_tensor, remote_tensor
 
         def split_list(lst: Optional[List]):
-            return ([lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None,
-                    [lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None)
+            if lst is None:
+                return None, None
+            assert len(lst) == len(mask), "List length must match mask length"
+            return ([lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None,
+                    [lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None)
 
 
         
@@ -186,125 +194,133 @@ class ForwardBatch:
 
         # Split core tensors
         local_batch.input_ids, remote_batch.input_ids = split_tensor(self.input_ids)
-        local_batch.seq_lens = local_mask.sum(dim=-1, keepdim=True)
-        remote_batch.seq_lens = remote_mask.sum(dim=-1, keepdim=True)
-        
-        local_batch.seq_lens_sum = local_batch.seq_lens.sum().item()
-        remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item()
         
         local_batch.positions, remote_batch.positions = split_tensor(self.positions)
         local_batch.out_cache_loc, remote_batch.out_cache_loc = split_tensor(self.out_cache_loc)
         print("[SPLIT] local_batch.out_cache_loc: ", local_batch.out_cache_loc)
         print("[SPLIT] remote_batch.out_cache_loc: ", remote_batch.out_cache_loc)
-        local_batch.encoder_out_cache_loc, remote_batch.encoder_out_cache_loc = split_tensor(self.encoder_out_cache_loc)
 
+        
+        local_batch.seq_lens, remote_batch.seq_lens = split_tensor(self.seq_lens)
+        print("[SPLIT] local_batch.seq_lens: ", local_batch.seq_lens)
+        print("[SPLIT] remote_batch.seq_lens: ", remote_batch.seq_lens)
+        local_batch.seq_lens_sum = local_batch.seq_lens.sum().item() if local_batch.seq_lens is not None else 0
+        remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item() if remote_batch.seq_lens is not None else 0
         # Split other metadata
-        local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
-        remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        # local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        # remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
+        print(f"[SPLIT] self.req_pool_indices: {self.req_pool_indices}")
+        local_batch.req_pool_indices, remote_batch.req_pool_indices = split_tensor(self.req_pool_indices)
+        print(f"[SPLIT] local_batch.req_pool_indices: {local_batch.req_pool_indices}")
+        print(f"[SPLIT] remote_batch.req_pool_indices: {remote_batch.req_pool_indices}")
         # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
         # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
-        local_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
-        remote_batch.sampling_info = self.sampling_info  # Sampling info might remain the same
-        
-        # Copy attention backend
-        local_batch.req_to_token_pool = self.req_to_token_pool
-        remote_batch.req_to_token_pool = self.req_to_token_pool
-        local_batch.token_to_kv_pool = self.token_to_kv_pool
-        remote_batch.token_to_kv_pool = self.token_to_kv_pool
-        local_batch.attn_backend = self.attn_backend
-        remote_batch.attn_backend = self.attn_backend
         
 
         # Compute new batch sizes
         local_batch.batch_size = local_batch.input_ids.shape[0] if local_batch.input_ids is not None else 0
         remote_batch.batch_size = remote_batch.input_ids.shape[0] if remote_batch.input_ids is not None else 0
+                
+        # split rid_list
+        local_batch.rid_list, remote_batch.rid_list = split_list(self.rid_list)
+        print(f"[SPLIT] local_batch.rid_list: {local_batch.rid_list}")
+        print(f"[SPLIT] remote_batch.rid_list: {remote_batch.rid_list}")
 
         return local_batch, remote_batch
 
     def combine(self, fb_list: list["ForwardBatch"]) -> None:
         """
         Combines a list of ForwardBatch instances into the current one (in-place modification).
+        Uses pre-allocated memory for tensors to avoid fragmentation and improve efficiency.
 
         Args:
             fb_list (list[ForwardBatch]): The list of ForwardBatches to combine.
         """
-        
         if len(fb_list) == 0:
             return
 
-        # Collect tensors and lists from all batches
+        # Helper function to check if a tensor is valid
         def is_valid_tensor(t):
             return t is not None and t.numel() > 0
 
+        # Helper function to check if a sequence length tensor is valid
+        def is_valid_seq_len(t):
+            return t is not None and (t.numel() > 1 or (t.numel() > 0 and t.item() != 0))
+
         # Collect tensors and lists from all batches
         input_ids_list = [self.input_ids] if is_valid_tensor(self.input_ids) else []
-        seq_lens_list = [self.seq_lens] if is_valid_tensor(self.seq_lens) else []
+        seq_lens_list = [self.seq_lens] if is_valid_seq_len(self.seq_lens) else []
         positions_list = [self.positions] if is_valid_tensor(self.positions) else []
         out_cache_loc_list = [self.out_cache_loc] if is_valid_tensor(self.out_cache_loc) else []
-        encoder_out_cache_loc_list = [self.encoder_out_cache_loc] if is_valid_tensor(self.encoder_out_cache_loc) else []
-        print(f"seq_lens_list: {seq_lens_list}")
-        image_inputs_list = self.image_inputs if self.image_inputs is not None else []
-        lora_paths_list = self.lora_paths if self.lora_paths is not None else []
+        req_pool_indices_list = [self.req_pool_indices] if is_valid_tensor(self.req_pool_indices) else []
+
+        # Collect tensors from other batches
+        for other in fb_list:
+            if is_valid_tensor(other.input_ids):
+                input_ids_list.append(other.input_ids)
+            if is_valid_seq_len(other.seq_lens):
+                seq_lens_list.append(other.seq_lens)
+            if is_valid_tensor(other.positions):
+                positions_list.append(other.positions)
+            if is_valid_tensor(other.out_cache_loc):
+                out_cache_loc_list.append(other.out_cache_loc)
+            if is_valid_tensor(other.req_pool_indices):
+                req_pool_indices_list.append(other.req_pool_indices)
+
+        # Pre-allocate memory and combine tensors
+        def combine_tensors(tensor_list):
+            if not tensor_list:
+                return None
+
+            # Calculate total size
+            total_size = 0
+            for tensor in tensor_list:
+                if tensor.numel() == 1:
+                    total_size += 1
+                else:
+                    total_size += tensor.numel()
+
+            # Pre-allocate memory
+            combined_tensor = torch.empty((total_size,), dtype=tensor_list[0].dtype, device=tensor_list[0].device)
+
+            # Fill the pre-allocated tensor
+            index = 0
+            for tensor in tensor_list:
+                if tensor.numel() == 1:
+                    combined_tensor[index] = tensor.item()  # Extract the single element
+                    index += 1
+                else:
+                    combined_tensor[index:index + tensor.numel()] = tensor  # Copy all elements
+                    index += tensor.numel()
+
+            return combined_tensor
+
+        # Combine each tensor list
+        self.input_ids = combine_tensors(input_ids_list)
+        self.seq_lens = combine_tensors(seq_lens_list)
+        self.positions = combine_tensors(positions_list)
+        self.out_cache_loc = combine_tensors(out_cache_loc_list)
+        self.req_pool_indices = combine_tensors(req_pool_indices_list)
+
+        # Handle non-tensor attributes
+        self.image_inputs = self.image_inputs if self.image_inputs is not None else []
+        self.lora_paths = self.lora_paths if self.lora_paths is not None else []
+        self.rid_list = self.rid_list if self.rid_list is not None else []
 
         for other in fb_list:
-            if other.input_ids is not None:
-                input_ids_list.append(other.input_ids)
-            if other.seq_lens is not None:
-                seq_lens_list.append(other.seq_lens)
-            if other.positions is not None:
-                positions_list.append(other.positions)
-            if other.out_cache_loc is not None:
-                out_cache_loc_list.append(other.out_cache_loc)
-            if other.encoder_out_cache_loc is not None:
-                encoder_out_cache_loc_list.append(other.encoder_out_cache_loc)
-
             if other.image_inputs is not None:
-                image_inputs_list.extend(other.image_inputs)
+                self.image_inputs.extend(other.image_inputs)
             if other.lora_paths is not None:
-                lora_paths_list.extend(other.lora_paths)
+                self.lora_paths.extend(other.lora_paths)
+            if other.rid_list is not None:
+                self.rid_list.extend(other.rid_list)
 
             self.seq_lens_sum += other.seq_lens_sum
             self.batch_size += other.batch_size
 
-            # Modify attention pools in place
-            print(f"COMBINING: {self.req_to_token_pool}, {other.req_to_token_pool}")
-            self.req_to_token_pool = other.req_to_token_pool  # Reference update
-            print(f"COMBINED: {self.token_to_kv_pool}, {other.token_to_kv_pool}")
-            self.token_to_kv_pool = other.token_to_kv_pool  # Reference update
-            print(f"MIGRATED: {self.req_to_token_pool}, {other.req_to_token_pool}")
-
             # Update sampling info
             self.sampling_info = self.sampling_info or other.sampling_info
-
-            # Update attention backend
-            self.attn_backend = other.attn_backend  # Reference update
-
-            # Concatenate tensors in one operation, or use the single element if list length is 1
-            print(f"input_ids_list: {input_ids_list} len: {len(input_ids_list)}")
-            self.input_ids = input_ids_list[0] if len(input_ids_list) == 1 else torch.cat(input_ids_list, dim=0) if input_ids_list else None
-            print(f"self.input_ids: {self.input_ids}")
-            print(f"seq_lens_list: {seq_lens_list} len: {len(seq_lens_list)}")
-            # add seq_len up in seq_lens_list
             
-            self.seq_lens = torch.tensor([sum(t.item() for t in seq_lens_list)],device=self.seq_lens.device)
-            print(f"self.seq_lens: {self.seq_lens}")
-            print(f"positions_list: {positions_list} len: {len(positions_list)}")
-            self.positions = positions_list[0] if len(positions_list) == 1 else torch.cat(positions_list, dim=0) if positions_list else None
-            print(f"self.positions: {self.positions}")
-            print("[BEFORE COMBINE] self.out_cache_loc: ", self.out_cache_loc)
-            self.out_cache_loc = out_cache_loc_list[0] if len(out_cache_loc_list) == 1 else torch.cat(out_cache_loc_list, dim=0) if out_cache_loc_list else None
-            print("[COMBINE] self.out_cache_loc: ", self.out_cache_loc)
-            self.encoder_out_cache_loc = (
-                encoder_out_cache_loc_list[0] if len(encoder_out_cache_loc_list) == 1 else torch.cat(encoder_out_cache_loc_list, dim=0)
-                if encoder_out_cache_loc_list else None
-            )
-
-        # Assign updated lists
-        self.image_inputs = image_inputs_list if image_inputs_list else None
-        self.lora_paths = lora_paths_list if lora_paths_list else None
-
-
-
     
     def compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -392,6 +408,7 @@ class ForwardBatch:
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             input_embeds=batch.input_embeds,
+            rid_list=batch.rid_list,
         )
 
         if ret.global_num_tokens is not None:
