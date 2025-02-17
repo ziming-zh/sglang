@@ -434,21 +434,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             fetched_residuals = []
             fetched_forward_batch = []
             device = x_local.device
-            self.retrieve_results()
             finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
+            self.retrieve_results()
             while not x_local.numel() and len(finished_tasks)==0:
                 # stall here if x_local is empty and no remote tasks are finished
-                self.retrieve_results()
                 finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
+                self.retrieve_results()
                 self.round_id += 1
                 time.sleep(0.1)
                 print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
             for key in finished_tasks:
-                cpu_result = self.cpu_buffer[key]
+                try:
+                    cpu_result = self.cpu_buffer[key]
+                except KeyError as e:
+                    print(f"Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
+                    raise e
                 print(f"[Task {key}] finished at {time.time()}")
                 # with torch.cuda.stream(self.stream_gpu):
-                gpu_result = cpu_result[0].to(device, non_blocking=True)
-                residual_gpu = cpu_result[1].to(device, non_blocking=True) if cpu_result[1] is not None else None
+                gpu_result = cpu_result[0].to(device)
+                residual_gpu = cpu_result[1].to(device) if cpu_result[1] is not None else None
                 forward_batch_remote = cpu_result[2]
                 fetched_cpu_results.append(gpu_result)
                 fetched_residuals.append(residual_gpu)
