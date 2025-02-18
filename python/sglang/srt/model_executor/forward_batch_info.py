@@ -197,22 +197,22 @@ class ForwardBatch:
         
         local_batch.positions, remote_batch.positions = split_tensor(self.positions)
         local_batch.out_cache_loc, remote_batch.out_cache_loc = split_tensor(self.out_cache_loc)
-        print("[SPLIT] local_batch.out_cache_loc: ", local_batch.out_cache_loc)
-        print("[SPLIT] remote_batch.out_cache_loc: ", remote_batch.out_cache_loc)
+        # print("[SPLIT] local_batch.out_cache_loc: ", local_batch.out_cache_loc)
+        # print("[SPLIT] remote_batch.out_cache_loc: ", remote_batch.out_cache_loc)
 
         
         local_batch.seq_lens, remote_batch.seq_lens = split_tensor(self.seq_lens)
-        print("[SPLIT] local_batch.seq_lens: ", local_batch.seq_lens)
-        print("[SPLIT] remote_batch.seq_lens: ", remote_batch.seq_lens)
+        # print("[SPLIT] local_batch.seq_lens: ", local_batch.seq_lens)
+        # print("[SPLIT] remote_batch.seq_lens: ", remote_batch.seq_lens)
         local_batch.seq_lens_sum = local_batch.seq_lens.sum().item() if local_batch.seq_lens is not None else 0
         remote_batch.seq_lens_sum = remote_batch.seq_lens.sum().item() if remote_batch.seq_lens is not None else 0
         # Split other metadata
         # local_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
         # remote_batch.req_pool_indices = self.req_pool_indices if self.req_pool_indices is not None else None
-        print(f"[SPLIT] self.req_pool_indices: {self.req_pool_indices}")
+        # print(f"[SPLIT] self.req_pool_indices: {self.req_pool_indices}")
         local_batch.req_pool_indices, remote_batch.req_pool_indices = split_tensor(self.req_pool_indices)
-        print(f"[SPLIT] local_batch.req_pool_indices: {local_batch.req_pool_indices}")
-        print(f"[SPLIT] remote_batch.req_pool_indices: {remote_batch.req_pool_indices}")
+        # print(f"[SPLIT] local_batch.req_pool_indices: {local_batch.req_pool_indices}")
+        # print(f"[SPLIT] remote_batch.req_pool_indices: {remote_batch.req_pool_indices}")
         # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
         # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
         
@@ -223,8 +223,14 @@ class ForwardBatch:
                 
         # split rid_list
         local_batch.rid_list, remote_batch.rid_list = split_list(self.rid_list)
-        print(f"[SPLIT] local_batch.rid_list: {local_batch.rid_list}")
-        print(f"[SPLIT] remote_batch.rid_list: {remote_batch.rid_list}")
+        # print(f"[SPLIT] local_batch.rid_list: {local_batch.rid_list}")
+        # print(f"[SPLIT] remote_batch.rid_list: {remote_batch.rid_list}")
+        # keep_indices = mask.nonzero(as_tuple=True)[0]
+        # keep_indices_list = keep_indices.tolist()
+        # remove_indices = (~mask).nonzero(as_tuple=True)[0]
+        # remove_indices_list = remove_indices.tolist()
+        # local_batch.sampling_info = self.sampling_info.filter_batch(keep_indices_list, keep_indices)
+        # remote_batch.sampling_info = self.sampling_info.filter_batch(remove_indices_list, remove_indices)
 
         return local_batch, remote_batch
 
@@ -319,7 +325,7 @@ class ForwardBatch:
             self.batch_size += other.batch_size
 
             # Update sampling info
-            self.sampling_info = self.sampling_info or other.sampling_info
+            # self.sampling_info.merge_batch(other.sampling_info)
             
     
     def compute_mrope_positions(

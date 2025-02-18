@@ -530,7 +530,7 @@ class ScheduleBatch:
     device: str = "cuda"
     
     # inactive request cache
-    inactive_reqs_batch: Optional["InactiveScheduleBatch"] = None
+    inactive_reqs_batch = None
     rid_list: List[str] = None
 
     @classmethod
@@ -554,7 +554,6 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
-            inactive_reqs_batch=InactiveScheduleBatch(),
         )
 
     def batch_size(self):
@@ -1059,9 +1058,9 @@ class ScheduleBatch:
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
-        self.sampling_info.filter_batch(keep_indices, new_indices)
+        # self.sampling_info.filter_batch(keep_indices, new_indices)
 
-    def merge_batch(self, other: Union["InactiveScheduleBatch", "ScheduleBatch"]):
+    def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1076,17 +1075,18 @@ class ScheduleBatch:
             self.top_logprobs_nums = other.top_logprobs_nums
             self.has_stream = other.has_stream
             self.has_grammar = other.has_grammar
+            # self.sampling_info = other.sampling_info
             return
         
-        if hasattr(other, "sampling_info"):
-            self.sampling_info.merge_batch(other.sampling_info)
+        # if hasattr(other, "sampling_info"):
+        #     self.sampling_info.merge_batch(other.sampling_info)
 
             # Encoder-decoder infos
             if self.model_config.is_encoder_decoder:
                 self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
                 self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
                 
-        if other.reqs is None or len(other.reqs) == 0:
+        if other is None or other.reqs is None or len(other.reqs) == 0:
             return
         
 
@@ -1108,39 +1108,92 @@ class ScheduleBatch:
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
         self.has_grammar = self.has_grammar or other.has_grammar
-        
-    def split_batch(self, keep_indices: List[int]) -> "InactiveScheduleBatch":
-        """Filter the current batch, and return the filtered-out elements as a new InactiveScheduleBatch."""
-        split_indices = [i for i in range(len(self.reqs)) if i not in keep_indices]
-        split_reqs = [self.reqs[i] for i in split_indices]
-        new_indices = torch.tensor(split_indices, dtype=torch.int32).to(self.device, non_blocking=True)
-        print(f"[SPLIT_BATCH] split_indices: {split_indices}")
-        print(f"[SPLIT_BATCH] req_pool_indices: {self.req_pool_indices}")
-        split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
-        split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
-        # split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
+            
+    def split_batch(
+        self,
+        being_chunked_req: Optional[Req] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        if keep_indices is None:
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
+            ]
 
-        split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
-        split_return_logprob = any(req.return_logprob for req in split_reqs)
-        split_top_logprobs_nums = [self.top_logprobs_nums[i] for i in split_indices] if self.top_logprobs_nums is not None else None
-        split_has_stream = any(req.stream for req in split_reqs)
-        split_has_grammar = any(req.grammar for req in split_reqs)
-        
-        self.filter_batch(keep_indices=keep_indices, keep_output_ids=True)
-        
-        return InactiveScheduleBatch(
-            reqs=split_reqs,
-            req_pool_indices=split_req_pool_indices,
-            seq_lens=split_seq_lens,
-            output_ids=None,
-            seq_lens_sum=split_seq_lens_sum,
-            return_logprob=split_return_logprob,
-            top_logprobs_nums=split_top_logprobs_nums,
-            has_stream=split_has_stream,
-            has_grammar=split_has_grammar,
-            device=self.device
+        if keep_indices is None or len(keep_indices) == 0:
+            # Move all requests to the opposite batch, self becomes empty
+            opposite_batch = ScheduleBatch(
+                reqs=self.reqs,
+                seq_lens=self.seq_lens,
+                out_cache_loc=self.out_cache_loc,
+                seq_lens_sum=self.seq_lens_sum,
+                req_pool_indices=self.req_pool_indices,
+                return_logprob=self.return_logprob,
+                has_stream=self.has_stream,
+                has_grammar=self.has_grammar,
+                # sampling_info=self.sampling_info.clone(),
+                output_ids=None,  # No filtering of output_ids in the opposite batch
+            )
+
+            # Clear self
+            self.reqs = []
+            self.seq_lens = None
+            self.out_cache_loc = None
+            self.seq_lens_sum = 0
+            self.req_pool_indices = None
+            self.return_logprob = False
+            self.has_stream = False
+            self.has_grammar = False
+            # self.sampling_info.clear()
+            
+            return opposite_batch
+
+        if len(keep_indices) == len(self.reqs):
+            # No need to split, opposite batch is empty
+            return None
+
+        # Compute indices for removed requests
+        remove_indices = [i for i in range(len(self.reqs)) if i not in keep_indices]
+
+        # Extract new batch properties
+        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        removed_indices = torch.tensor(remove_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
         )
 
+        # Create opposite batch with removed requests
+        opposite_batch = ScheduleBatch(
+            reqs=[self.reqs[i] for i in remove_indices],
+            seq_lens=self.seq_lens[removed_indices],
+            out_cache_loc=None,
+            seq_lens_sum=self.seq_lens[removed_indices].sum().item(),
+            req_pool_indices=self.req_pool_indices[removed_indices],
+            return_logprob=any(self.reqs[i].return_logprob for i in remove_indices),
+            has_stream=any(self.reqs[i].stream for i in remove_indices),
+            has_grammar=any(self.reqs[i].grammar for i in remove_indices),
+            # sampling_info=self.sampling_info.filter_batch(remove_indices, removed_indices),
+            output_ids=None,  # Opposite batch does not retain output_ids
+        )
+
+        # Modify self in place (filtered batch)
+        self.reqs = [self.reqs[i] for i in keep_indices]
+        self.seq_lens = self.seq_lens[new_indices]
+        self.req_pool_indices = self.req_pool_indices[new_indices]
+        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.out_cache_loc = None
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
+        else:
+            self.top_logprobs_nums = None
+        self.has_stream = any(req.stream for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
+        # self.sampling_info.filter_batch(keep_indices, new_indices)
+
+        return opposite_batch
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
@@ -1202,7 +1255,7 @@ class ScheduleBatch:
         # self.extend_num_tokens = model_worker_batch.extend_num_tokens
         
         if self.forward_mode.is_decode():
-            print("[BEFORE] self.reqs: ", self.reqs)
+            # print("[BEFORE] self.reqs: ", self.reqs)
             print("[BEFORE] self.seq_lens: ", self.seq_lens)
             print("[BEFORE] self.output_ids: ", self.output_ids)
             if self.inactive_reqs_batch is not None:
@@ -1210,14 +1263,19 @@ class ScheduleBatch:
             # self.rid_list = model_worker_batch.rid_list
             # Put the req into inactive_req list if its rid is not within the model_worker_batch.rid_list
             inactive_reqs_idx = [i for i, req in enumerate(self.reqs) if req.rid in model_worker_batch.rid_list]
-            cached_inactive_req_batch = self.split_batch(inactive_reqs_idx)
+            cached_inactive_req_batch = self.split_batch(keep_indices=inactive_reqs_idx)
+            
+            # if no inactive reqs, directly update the batch and return
+            if self.inactive_reqs_batch is None:
+                self.inactive_reqs_batch = cached_inactive_req_batch
+                return
+            
             if self.inactive_reqs_batch.reqs is not None:
                 to_active_reqs_idx = [i for i, req in enumerate(self.inactive_reqs_batch.reqs) if req.rid not in model_worker_batch.rid_list]
-                cached_active_req_batch = self.inactive_reqs_batch.split_batch(to_active_reqs_idx)
+                cached_active_req_batch = self.inactive_reqs_batch.split_batch(keep_indices=to_active_reqs_idx)
                 self.merge_batch(cached_active_req_batch)
-            
             self.inactive_reqs_batch.merge_batch(cached_inactive_req_batch)
-            print("[AFTER] self.reqs: ", self.reqs)
+            # print("[AFTER] self.reqs: ", self.reqs)
             print("[AFTER] self.seq_lens: ", self.seq_lens)
             print("[AFTER] self.output_ids: ", self.output_ids)
             if self.inactive_reqs_batch is not None:
@@ -1267,108 +1325,6 @@ class ScheduleBatch:
             f"#req={(len(self.reqs))})"
         )
 
-
-@dataclasses.dataclass
-class InactiveScheduleBatch:
-    """Cache inactive requests to allow reactivation when needed."""
-    
-    reqs: List[Req] = None
-    req_pool_indices: Optional[torch.Tensor] = None
-    seq_lens: Optional[torch.Tensor] = None
-    output_ids: Optional[torch.Tensor] = None
-    seq_lens_sum: int = 0
-    return_logprob: bool = False
-    top_logprobs_nums: Optional[List[int]] = None
-    has_stream: bool = False
-    has_grammar: bool = False
-    device: str = "cuda"
-    
-    def filter_batch(self, keep_indices: Optional[List[int]] = None):
-        if keep_indices is None or len(keep_indices) == 0:
-            self.reqs = []
-            return
-
-        if len(keep_indices) == len(self.reqs):
-            return
-
-        self.reqs = [self.reqs[i] for i in keep_indices]
-        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(self.device, non_blocking=True)
-        if self.req_pool_indices is not None:
-            self.req_pool_indices = self.req_pool_indices[new_indices]
-        if self.seq_lens is not None:
-            self.seq_lens = self.seq_lens[new_indices]
-            self.seq_lens_sum = self.seq_lens.sum().item()
-        if self.return_logprob:
-            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
-
-        self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
-    
-    def merge_batch(self, other: Union["InactiveScheduleBatch", "ScheduleBatch"]):
-        if not self.reqs or len(self.reqs) == 0:
-            # Directly take over the content if the current batch is empty
-            self.reqs = other.reqs
-            self.req_pool_indices = other.req_pool_indices
-            self.seq_lens = other.seq_lens
-            # self.output_ids = other.output_ids
-            self.seq_lens_sum = other.seq_lens_sum
-            self.return_logprob = other.return_logprob
-            self.top_logprobs_nums = other.top_logprobs_nums
-            self.has_stream = other.has_stream
-            self.has_grammar = other.has_grammar
-            return
-        
-        self.req_pool_indices = torch.concat([self.req_pool_indices, other.req_pool_indices]) if self.req_pool_indices is not None else None
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens]) if self.seq_lens is not None else None
-        # self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
-        self.seq_lens_sum += other.seq_lens_sum
-        self.reqs.extend(other.reqs)
-        
-        if self.return_logprob and other.return_logprob:
-            self.top_logprobs_nums.extend(other.top_logprobs_nums)
-        elif self.return_logprob:
-            self.top_logprobs_nums.extend([0] * len(other.reqs))
-        elif other.return_logprob:
-            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-        
-        self.return_logprob = self.return_logprob or other.return_logprob
-        self.has_stream = self.has_stream or other.has_stream
-        self.has_grammar = self.has_grammar or other.has_grammar
-        
-    def split_batch(self, keep_indices: List[int]) -> "InactiveScheduleBatch":
-        """Filter the current batch, and return the filtered-out elements as a new InactiveScheduleBatch."""
-        
-        if self.reqs is None or len(self.reqs) == 0:
-            return InactiveScheduleBatch(device=self.device)
-        
-        split_indices = [i for i in range(len(self.reqs)) if i not in keep_indices]
-        split_reqs = [self.reqs[i] for i in split_indices]
-        new_indices = torch.tensor(split_indices, dtype=torch.int32).to(self.device, non_blocking=True)
-        keep_new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(self.device, non_blocking=True)
-        
-        split_req_pool_indices = self.req_pool_indices[new_indices] if self.req_pool_indices is not None else None
-        split_seq_lens = self.seq_lens[new_indices] if self.seq_lens is not None else None
-        # split_output_ids = self.output_ids[new_indices] if self.output_ids is not None else None
-        split_seq_lens_sum = split_seq_lens.sum().item() if split_seq_lens is not None else 0
-        split_return_logprob = any(req.return_logprob for req in split_reqs)
-        split_top_logprobs_nums = [self.top_logprobs_nums[i] for i in split_indices] if self.top_logprobs_nums is not None else None
-        split_has_stream = any(req.stream for req in split_reqs)
-        split_has_grammar = any(req.grammar for req in split_reqs)
-        
-        self.filter_batch(keep_indices=keep_indices)
-        
-        return InactiveScheduleBatch(
-            reqs=split_reqs,
-            req_pool_indices=split_req_pool_indices,
-            seq_lens=split_seq_lens,
-            output_ids=None,
-            seq_lens_sum=split_seq_lens_sum,
-            return_logprob=split_return_logprob,
-            top_logprobs_nums=split_top_logprobs_nums,
-            has_stream=split_has_stream,
-            has_grammar=split_has_grammar,
-            device=self.device
-        )
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
