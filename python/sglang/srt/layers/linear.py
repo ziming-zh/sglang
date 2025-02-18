@@ -1143,13 +1143,13 @@ class RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
         
-        print("[RowParallelLinear all_reduce] output_parallel", output_parallel.shape, output_parallel.device)
+        # print("[RowParallelLinear all_reduce] output_parallel", output_parallel.shape, output_parallel.device)
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
         # torch.cuda.synchronize()
-        print("[RowParallelLinear all_reduce] output", output.shape, output_parallel.device)
+        # print("[RowParallelLinear all_reduce] output", output.shape, output_parallel.device)
         output_bias = self.bias if self.skip_bias_add else None
 
         return output, output_bias

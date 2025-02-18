@@ -99,13 +99,13 @@ class MixtralMoE(nn.Module):
        
     def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, complete_token_manager: Optional[CompleteTokenQueryService] = None, task_queue=None, result_queue=None):
         if(self.swap_experts==True):
-            print("[Testing]Swapping experts")
+            # print("[Testing]Swapping experts")
             import time
             start = time.time()
             self.experts.quant_method.update_experts(self.experts, 1, "remove", available_experts=self.experts.available_experts)
             self.experts.quant_method.update_experts(self.experts, 1, "load", torch.randn(2 * self.experts.intermediate_size_per_partition, self.hidden_size), torch.randn(self.hidden_size, self.experts.intermediate_size_per_partition), available_experts=self.experts.available_experts)
             end = time.time()
-            print(f"[Testing]Swapping experts took {end-start} seconds")
+            # print(f"[Testing]Swapping experts took {end-start} seconds")
             self.swap_experts=False
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -129,14 +129,14 @@ class MixtralMoE(nn.Module):
         
         if self.tp_size > 1:
             if is_decode_mode:
-                print(f"[Testing]Final hidden states shape: {final_hidden_states.shape}")
+                # print(f"[Testing]Final hidden states shape: {final_hidden_states.shape}")
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
             else:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
                 
-        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
         # torch.cuda.synchronize()
-        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
         # print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
@@ -222,10 +222,10 @@ class MixtralAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         # print(f"[MIXTRAL qkv_proj]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        try:
-            print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        except Exception as e:
-            print(f"[MIXTRAL qkv split] Layer id: {self.layer_id}, Error: {e}")
+        # try:
+        #     print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # except Exception as e:
+        #     print(f"[MIXTRAL qkv split] Layer id: {self.layer_id}, Error: {e}")
         # print("Position storage after clone:", positions.storage().data_ptr())
         # check the size of q, k before and after rotary_emb
         # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
@@ -236,10 +236,10 @@ class MixtralAttention(nn.Module):
         # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
         # print("Query storage:", q.storage().data_ptr())
         # print("Key storage:", k.storage().data_ptr())
-        try:
-            print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        except Exception as e:
-            print(f"[MIXTRAL Attention] Layer id: {self.layer_id}, Error: {e}")
+        # try:
+        #     print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # except Exception as e:
+        #     print(f"[MIXTRAL Attention] Layer id: {self.layer_id}, Error: {e}")
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -316,17 +316,17 @@ class MixtralDecoderLayer(nn.Module):
         
         is_decode_mode = forward_batch.forward_mode.is_decode()
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before post attention: {forward_batch.out_cache_loc}")
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before post-attention: {hidden_states.shape}, device: {hidden_states.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before post-attention: {hidden_states.shape}, device: {hidden_states.device}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
         hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager, task_queue=self.task_queue, result_queue=self.result_queue)
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
@@ -397,7 +397,7 @@ class MixtralModel(nn.Module):
         if hidden_states.numel() > 0:
             hidden_states, _ = self.norm(hidden_states, residual)
             
-        print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
+        # print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
         return hidden_states, forward_batch
 
 
@@ -423,7 +423,7 @@ class MixtralForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ) -> torch.Tensor:
-        print(f"[MixtralForCausalLM]Forward batch input_ids: {input_ids}")
+        # print(f"[MixtralForCausalLM]Forward batch input_ids: {input_ids}")
         assert input_ids.storage() is not None, "Input has no storage."
         hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds, complete_token_manager)
         return self.logits_processor(

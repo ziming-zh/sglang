@@ -348,7 +348,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         x_remote = x[is_remote_toks]
         x_local = x[~is_remote_toks]
-        print(f"[SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+        # print(f"[SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
 
         topk_weights_remote = topk_weights[is_remote_toks]
         topk_ids_remote = topk_ids[is_remote_toks]
@@ -427,7 +427,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
             # retrieve results from the worker process
             
-            print("[FORWARD_CUDA] local input shape", x_local.shape, x_local.device)
+            # print("[FORWARD_CUDA] local input shape", x_local.shape, x_local.device)
             
             # Check for completed CPU computations and move back to GPU
             fetched_cpu_results = []
@@ -437,12 +437,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
             self.retrieve_results()
             while not x_local.numel() and len(finished_tasks)==0:
+                self.round_id += 1
                 # stall here if x_local is empty and no remote tasks are finished
                 finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
                 self.retrieve_results()
-                self.round_id += 1
                 time.sleep(0.1)
-                print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
+                # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
             for key in finished_tasks:
                 try:
                     cpu_result = self.cpu_buffer[key]
@@ -490,6 +490,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         Retrieve results from the worker process.
         Should be called periodically to check for completed tasks.
         """
+        if self.result_queue.empty():
+            print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
         while not self.result_queue.empty():
             task_id, cpu_result = self.result_queue.get()
             residual_remote_cpu, forward_batch_remote = self.task_metadata[task_id]
