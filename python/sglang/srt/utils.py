@@ -1270,7 +1270,7 @@ def should_use_tensor_core(
 class CompleteTokenQueryService:
     def __init__(self, tp_rank_range, manager, num_layers=32):
         self.tp_rank_range = tp_rank_range
-        self.lock = manager.Lock()  # Manager Lock for atomic access
+        self.locks = {layer_id: manager.Lock() for layer_id in range(num_layers)}
 
         # Dictionary-based cache: cache_key[layer_id] and cache_value[layer_id]
         self.cache_key = manager.dict({layer_id: f"layer_{layer_id}" for layer_id in range(num_layers)})
@@ -1281,7 +1281,7 @@ class CompleteTokenQueryService:
 
     def update_token(self, token, layer_id):
         """Atomically update the computation count for a specific token in the given layer."""
-        with self.lock:
+        with self.locks[layer_id]:
             layer_compute_cnt = self.compute_cnt[layer_id]  # Access specific layer compute count
 
             if token in layer_compute_cnt:
@@ -1294,7 +1294,7 @@ class CompleteTokenQueryService:
         """Query completed tokens for a specific layer_id key."""
         key = f"{round_id}.{layer_id}"
 
-        with self.lock:
+        with self.locks[layer_id]:
             # Cache hit: Return stored result
             if self.cache_key.get(layer_id) == key:
                 # print(f"Cache hit for layer {layer_id}: {self.cache_value[layer_id]}")
@@ -1306,7 +1306,7 @@ class CompleteTokenQueryService:
             for token, count in list(layer_compute_cnt.items()):  # Use list() to avoid runtime error
                 if count == self.tp_rank_range:
                     finished_tokens.append(token)
-                    print(f"Token {token} finished in Layer {layer_id}: {count}")
+                    # print(f"Token {token} finished in Layer {layer_id}: {count}")
                     # Delete the token from the compute count
                     del layer_compute_cnt[token]
 
