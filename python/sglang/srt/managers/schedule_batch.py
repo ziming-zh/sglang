@@ -982,7 +982,7 @@ class ScheduleBatch:
         # Alloc mem
         bs = len(self.reqs)
         print(f"Allocating {bs} tokens for decoding")
-        print(f"[REQS] {self.reqs}")
+        # print(f"[REQS] {self.reqs}")
         self.out_cache_loc = self.alloc_token_slots(bs)
         self.rid_list = self.get_active_rids()
         print(f"[RID_LIST] {self.rid_list}")
@@ -1257,9 +1257,9 @@ class ScheduleBatch:
         if self.forward_mode.is_decode():
             # print("[BEFORE] self.reqs: ", self.reqs)
             print("[BEFORE] self.seq_lens: ", self.seq_lens)
-            print("[BEFORE] self.output_ids: ", self.output_ids)
-            if self.inactive_reqs_batch is not None:
-                print("[BEFORE] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
+            # print("[BEFORE] self.output_ids: ", self.output_ids)
+            # if self.inactive_reqs_batch is not None:
+            #     print("[BEFORE] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
             # self.rid_list = model_worker_batch.rid_list
             # Put the req into inactive_req list if its rid is not within the model_worker_batch.rid_list
             inactive_reqs_idx = [i for i, req in enumerate(self.reqs) if req.rid in model_worker_batch.rid_list]
@@ -1277,9 +1277,9 @@ class ScheduleBatch:
             self.inactive_reqs_batch.merge_batch(cached_inactive_req_batch)
             # print("[AFTER] self.reqs: ", self.reqs)
             print("[AFTER] self.seq_lens: ", self.seq_lens)
-            print("[AFTER] self.output_ids: ", self.output_ids)
-            if self.inactive_reqs_batch is not None:
-                print("[AFTER] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
+            # print("[AFTER] self.output_ids: ", self.output_ids)
+            # if self.inactive_reqs_batch is not None:
+                # print("[AFTER] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
 
         # if model_worker_batch.extend_seq_lens is not None:
         #     self.extend_lens = model_worker_batch.extend_seq_lens

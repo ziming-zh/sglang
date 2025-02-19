@@ -743,7 +743,7 @@ def decode_attention_fwd_grouped(
         b_seq_len,
     )
     
-    print(f"Triton kernel called successfully, cuda {args['q'].device}")
+    # print(f"Triton kernel called successfully, cuda {args['q'].device}")
 
 
 def decode_attention_fwd(

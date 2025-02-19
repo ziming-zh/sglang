@@ -348,7 +348,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         x_remote = x[is_remote_toks]
         x_local = x[~is_remote_toks]
-        # print(f"[SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+        print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+        num_seqs = x.shape[0]
 
         topk_weights_remote = topk_weights[is_remote_toks]
         topk_ids_remote = topk_ids[is_remote_toks]
@@ -376,14 +377,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.remote_forward_batch_list = []
 
             if x_remote.numel() > 0:
-                print(f"Combining {x_remote.numel()} remote tokens, cuda {x_remote.device}")
+                # print(f"Combining {x_remote.numel()} remote tokens, cuda {x_remote.device}")
                 # self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
                 self.remote_forward_batch_list.append(forward_batch_remote)
                 self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
             # Only offload when buffer size is 20 or more
             # Offload when buffer size reaches threshold
             if len(self.remote_buffer) >= 1:
-                print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU, cuda {x_remote.device}")
+                # print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU, cuda {x_remote.device}")
                 
                 # generate a unique task ID
                 task_id = random.randint(0, 1000000)
@@ -391,7 +392,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 with torch.cuda.stream(self.stream_cpu):
                     x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu", non_blocking=True)
                     self.remote_forward_batch = forward_batch_remote.combine(self.remote_forward_batch_list[:-1])
-                    print(f"offload task {task_id} dispatched at time {time.time()}, cuda {x_remote_cpu.device}")
+                    # print(f"offload task {task_id} dispatched at time {time.time()}, cuda {x_remote_cpu.device}")
 
                     topk_weights_remote_cpu = torch.cat([item[1] for item in self.remote_buffer], dim=0)
                     topk_ids_remote_cpu = torch.cat([item[2] for item in self.remote_buffer], dim=0)
@@ -407,7 +408,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     # Submit task to worker process (without residual_remote_cpu and forward_batch_remote)
                     self.task_queue.put((task_id, self.layer_id, x_remote_cpu, topk_weights_remote_cpu, topk_ids_remote_cpu, complete_token_manager))
 
-                    print(f"Task {task_id} sent to worker process at {time.time()}, cuda {x_remote_cpu.device}")
+                    # print(f"Task {task_id} sent to worker process at {time.time()}, cuda {x_remote_cpu.device}")
 
                 # Clear buffer
                 self.remote_buffer = []
@@ -436,19 +437,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             device = x_local.device
             finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
             self.retrieve_results()
-            while not x_local.numel() and len(finished_tasks)==0:
+            while not x_local.numel() and len(finished_tasks)<int(num_seqs*0.9)+1:
                 self.round_id += 1
                 # stall here if x_local is empty and no remote tasks are finished
                 finished_tasks = complete_token_manager.query(self.round_id, self.layer_id)
                 self.retrieve_results()
                 time.sleep(0.1)
-                # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
+                print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
             for key in finished_tasks:
                 try:
                     cpu_result = self.cpu_buffer[key]
                 except KeyError as e:
                     assert False, (f"Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
-                print(f"[Task {key}] finished at {time.time()}")
+                # print(f"[Task {key}] finished at {time.time()}")
                 # with torch.cuda.stream(self.stream_gpu):
                 gpu_result = cpu_result[0].to(device, non_blocking=True)
                 residual_gpu = cpu_result[1].to(device, non_blocking=True) if cpu_result[1] is not None else None
@@ -460,7 +461,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 del self.cpu_buffer[key]
 
             if len(fetched_cpu_results) > 0:
-                # print(f"Combined {len(fetched_cpu_results)} remote results at {time.time()}")
+                print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
                 # print(f"fetched_gpu_results: {fetched_cpu_results}")
                 x_local = torch.cat([x_local] + fetched_cpu_results, dim=0)
                 if residual_local is not None:
@@ -498,7 +499,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             self.cpu_buffer[task_id] = cpu_result, residual_remote_cpu, forward_batch_remote
             # remove the task metadata
             del self.task_metadata[task_id]
-            print(f"[layer {self.layer_id}] Task {task_id} retrieved at {time.time()}")
+            # print(f"[layer {self.layer_id}] Task {task_id} retrieved at {time.time()}")
 
     def __del__(self):
         """
@@ -1135,13 +1136,13 @@ class FusedMoE(torch.nn.Module):
         # print(f"[FORWARD] after quant_method.apply")
         # print(f"forward_batch.out_cache_loc: {forward_batch.out_cache_loc}")
         
-        print(f"[FINAL before all-reduce layer {self.layer_id}] final_hidden_states: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # print(f"[FINAL before all-reduce layer {self.layer_id}] final_hidden_states: {final_hidden_states.shape}, device: {final_hidden_states.device}")
 
         # Perform a tensor parallel all-reduce if necessary
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
             
-        print(f"[FINAL after all-reduce layer {self.layer_id}] final_hidden_states: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # print(f"[FINAL after all-reduce layer {self.layer_id}] final_hidden_states: {final_hidden_states.shape}, device: {final_hidden_states.device}")
 
         return final_hidden_states, residual, forward_batch
 

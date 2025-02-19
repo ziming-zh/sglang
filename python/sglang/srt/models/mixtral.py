@@ -361,8 +361,8 @@ class MixtralModel(nn.Module):
         # Create a queue for offloading tasks and a queue for results
         import multiprocessing as mp
         from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
-        self.task_queue = mp.Queue(maxsize=40)
-        self.result_queue = [mp.Queue(maxsize=40) for _ in range(config.num_hidden_layers)]
+        self.task_queue = mp.Queue(maxsize=1000)
+        self.result_queue = [mp.Queue(maxsize=1000) for _ in range(config.num_hidden_layers)]
         
         self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
         self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
