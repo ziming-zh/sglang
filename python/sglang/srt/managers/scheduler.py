@@ -792,7 +792,9 @@ class Scheduler:
             return new_batch
 
         # Run decode
+        # print("[GET_NEXT_BATCH_TO_RUN] new_batch is None, cannot prefill")
         if self.running_batch is None:
+            # print("[GET_NEXT_BATCH_TO_RUN] running_batch is None, return None")
             return None
         self.running_batch = self.update_running_batch(self.running_batch)
         return self.running_batch
@@ -806,16 +808,21 @@ class Scheduler:
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
         ) and self.being_chunked_req is None:
+            # print("[GET_NEW_PREFILL] batch_is_full or len(waiting_queue) == 0")
             return None
+        
+        print("[GET_NEW_PREFILL] len(waiting_queue):", len(self.waiting_queue))
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
         if running_bs >= self.max_running_requests:
             self.batch_is_full = True
+            print("[GET_NEW_PREFILL] running_bs >= max_running_requests")
             return None
 
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
+        print("[GET_NEW_PREFILL] remaining total tokens:", self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size())
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
@@ -850,10 +857,12 @@ class Scheduler:
                 )
                 > self.max_loras_per_batch
             ):
+                print("[GET_NEW_PREFILL] len(lora_set) > self.max_loras_per_batch, set batch_is_full = True")
                 self.batch_is_full = True
                 break
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                print("[GET_NEW_PREFILL] running_bs + len(adder.can_run_list) >= self.max_running_requests, set batch_is_full = True")
                 self.batch_is_full = True
                 break
 
@@ -861,12 +870,14 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    print("[GET_NEW_PREFILL] res == AddReqResult.NO_TOKEN, set batch_is_full = True")
                     self.batch_is_full = True
                 break
 
         # Update waiting queue
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
+            print("[GET_NEW_PREFILL] len(can_run_list) == 0")
             return None
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -901,6 +912,7 @@ class Scheduler:
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+            print("Warning: mixed chunked prefill is enabled")
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -917,6 +929,7 @@ class Scheduler:
         global test_retract
 
         initial_bs = batch.batch_size()
+        print(f"[UPDATE_RUNNING_BATCH] initial_bs: {initial_bs}")
 
         batch.filter_batch()
         if batch.is_empty():

@@ -533,6 +533,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
+            print(f"[MLA TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
@@ -542,6 +543,7 @@ class ModelRunner:
                 device=self.device,
             )
         elif self.server_args.enable_double_sparsity:
+            print(f"[DoubleSparse TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
@@ -552,6 +554,7 @@ class ModelRunner:
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
             )
         else:
+            print(f"[MHA TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
