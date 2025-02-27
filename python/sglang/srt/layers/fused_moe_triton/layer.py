@@ -90,7 +90,7 @@ def cpu_offload_worker(task_queue, result_queue_list, w13_cpu, w2_cpu):
         # Store the result in a shared queue
         result_queue = result_queue_list[layer_id]
         if result_queue.full():
-            # print(f"Result queue is full, failed to put task {task_id}")
+            print(f"Result queue is full, failed to put task {task_id}")
             pass
         else:
             # print(f"Offload task {task_id} completed at time {time.time()}")
@@ -459,6 +459,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 fetched_forward_batch.append(forward_batch_remote)
                 # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
                 del self.cpu_buffer[key]
+            
+            finished_tasks.clear()
 
             if len(fetched_cpu_results) > 0:
                 print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
@@ -635,8 +637,9 @@ class FusedMoE(torch.nn.Module):
         available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
+        pruned_top_k = 2
         # self.available_experts = available_experts or [True] * num_experts
-        self.available_experts = available_experts or [True] * 4 + [False] * (num_experts - 4) # temp: only 4 experts available
+        self.available_experts = available_experts or [True] * pruned_top_k + [False] * (num_experts - pruned_top_k) # temp: only 4 experts available
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
