@@ -1065,6 +1065,8 @@ class ScheduleBatch:
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
         if self.reqs is None or len(self.reqs) == 0:
+            if other is None or other.reqs is None or len(other.reqs) == 0:
+                return
             self.reqs = other.reqs
             self.req_pool_indices = other.req_pool_indices
             self.seq_lens = other.seq_lens
