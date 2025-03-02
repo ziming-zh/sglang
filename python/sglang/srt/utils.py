@@ -1305,6 +1305,7 @@ class CompleteTokenQueryService:
 
             for token, count in list(layer_compute_cnt.items()):  # Use list() to avoid runtime error
                 if count == self.tp_rank_range:
+                    print(f"self.tp_rank_range: {self.tp_rank_range}")
                     finished_tokens.append(token)
                     # print(f"Token {token} finished in Layer {layer_id}: {count}")
                     # Delete the token from the compute count

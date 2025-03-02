@@ -84,7 +84,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             # print("Received stop signal, exiting worker process")
             break  # Stop the worker when None is received
         start_time = time.time()
-        # print(f"[Offload Worker] task {task_id} received at time {time.time()}")
+        print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
         # Perform CPU computation
         cpu_result = fused_experts_cpu_impl(
             hidden_states=task.x_remote_cpu,
@@ -100,7 +100,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             print(f"Result queue is full, failed to put task {task.task_id}")
             pass
         else:
-            # print(f"Offload task {task_id} completed at time {time.time()}")
+            print(f"Offload task {task.task_id} completed at time {time.time()}")
             result_queue.put((task.task_id, cpu_result))
             complete_token_manager.update_token(task.task_id, task.layer_id)
 
@@ -393,6 +393,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 
                 # generate a unique task ID
                 task_id = random.randint(0, 1000000)
+                print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
 
                 with torch.cuda.stream(self.stream_cpu):
                     x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu")
