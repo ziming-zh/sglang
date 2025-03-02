@@ -84,7 +84,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             # print("Received stop signal, exiting worker process")
             break  # Stop the worker when None is received
         start_time = time.time()
-        print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
+        # print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
         # Perform CPU computation
         cpu_result = fused_experts_cpu_impl(
             hidden_states=task.x_remote_cpu,
@@ -100,14 +100,14 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             print(f"Result queue is full, failed to put task {task.task_id}")
             pass
         else:
-            print(f"Offload task {task.task_id} completed at time {time.time()}")
+            # print(f"Offload task {task.task_id} completed at time {time.time()}")
             result_queue.put((task.task_id, cpu_result))
             complete_token_manager.update_token(task.task_id, task.layer_id)
 
         # except Exception as e:
         #     print(f"Error in CPU offloading worker: {e}")
         end_time = time.time()
-        print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds")
+        # print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds")
 
 @register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -353,7 +353,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         x_remote = x[is_remote_toks]
         x_local = x[~is_remote_toks]
-        print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+        # print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
         num_seqs = x.shape[0]
 
         topk_weights_remote = topk_weights[is_remote_toks]
@@ -393,7 +393,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 
                 # generate a unique task ID
                 task_id = random.randint(0, 1000000)
-                print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
+                # print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
 
                 with torch.cuda.stream(self.stream_cpu):
                     x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu")
@@ -453,7 +453,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
                 self.retrieve_results()
                 time.sleep(0.025)
-                print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
+                # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
             for key in finished_tasks:
                 try:
                     cpu_result = self.cpu_buffer[key]
@@ -473,7 +473,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             finished_tasks.clear()
 
             if len(fetched_cpu_results) > 0:
-                print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
+                # print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
                 # print(f"fetched_gpu_results: {fetched_cpu_results}")
                 x_local = torch.cat([x_local] + fetched_cpu_results, dim=0)
                 if residual_local is not None:
@@ -503,8 +503,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         Retrieve results from the worker process.
         Should be called periodically to check for completed tasks.
         """
-        if self.result_queue.empty():
-            print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
+        # if self.result_queue.empty():
+        #     print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
         while not self.result_queue.empty():
             task_id, cpu_result = self.result_queue.get()
             residual_remote_cpu, forward_batch_remote = self.task_metadata[task_id]

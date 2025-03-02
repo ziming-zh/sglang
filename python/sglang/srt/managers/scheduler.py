@@ -929,7 +929,7 @@ class Scheduler:
         global test_retract
 
         initial_bs = batch.batch_size()
-        print(f"[UPDATE_RUNNING_BATCH] initial_bs: {initial_bs}")
+        # print(f"[UPDATE_RUNNING_BATCH] initial_bs: {initial_bs}")
 
         batch.filter_batch()
         if batch.is_empty():
