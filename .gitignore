@@ -226,3 +226,4 @@ compile_commands.json
 test_nccl.py
 run_nccl.sh
 datafolder
+openssl-3.4.1/**

@@ -27,7 +27,6 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
-from python.sglang.srt.utils import CompleteTokenQueryService
 from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
@@ -97,7 +96,7 @@ class MixtralMoE(nn.Module):
         )
         self.swap_experts=True
        
-    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, complete_token_manager: Optional[CompleteTokenQueryService] = None, task_queue=None, result_queue=None):
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, task_queue=None, result_queue=None):
         if(self.swap_experts==True):
             # print("[Testing]Swapping experts")
             import time
@@ -122,7 +121,7 @@ class MixtralMoE(nn.Module):
         
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager, task_queue=task_queue, result_queue=result_queue)
+        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, task_queue=task_queue, result_queue=result_queue)
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
         
         # print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
@@ -288,7 +287,6 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Self Attention
         # quit if hidden_states and residual are empty
@@ -325,7 +323,7 @@ class MixtralDecoderLayer(nn.Module):
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, complete_token_manager=complete_token_manager, task_queue=self.task_queue, result_queue=self.result_queue)
+        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, task_queue=self.task_queue, result_queue=self.result_queue)
         # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
@@ -358,23 +356,23 @@ class MixtralModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
-        # Create a queue for offloading tasks and a queue for results
-        import multiprocessing as mp
-        from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
-        self.task_queue = mp.Queue(maxsize=1000)
-        self.result_queue = [mp.Queue(maxsize=1000) for _ in range(config.num_hidden_layers)]
+        # # Create a queue for offloading tasks and a queue for results
+        # import multiprocessing as mp
+        # from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
+        # self.task_queue = mp.Queue(maxsize=1000)
+        # self.result_queue = [mp.Queue(maxsize=1000) for _ in range(config.num_hidden_layers)]
         
-        self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
-        self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
+        # self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
+        # self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
         
-        self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.w13_cpu, self.w2_cpu))
-        self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
-        self.worker_process.start()
+        # self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.complete_token_manager, self.w13_cpu, self.w2_cpu))
+        # self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
+        # self.worker_process.start()
         
         # register task_queue and result_queue to each layer
-        for layer_id, layer in enumerate(self.layers):
-            layer.task_queue = self.task_queue
-            layer.result_queue = self.result_queue[layer_id]
+        # for layer_id, layer in enumerate(self.layers):
+        #     layer.task_queue = self.task_queue
+        #     layer.result_queue = self.result_queue[layer_id]
 
     def forward(
         self,
@@ -382,7 +380,6 @@ class MixtralModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -392,7 +389,7 @@ class MixtralModel(nn.Module):
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual, forward_batch = layer(
-                forward_batch.positions, hidden_states, forward_batch, residual, complete_token_manager=complete_token_manager
+                forward_batch.positions, hidden_states, forward_batch, residual
             )
         if hidden_states.numel() > 0:
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -421,11 +418,10 @@ class MixtralForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ) -> torch.Tensor:
         # print(f"[MixtralForCausalLM]Forward batch input_ids: {input_ids}")
         assert input_ids.storage() is not None, "Input has no storage."
-        hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds, complete_token_manager)
+        hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             forward_batch.input_ids, hidden_states, self.lm_head, forward_batch
         ), forward_batch
