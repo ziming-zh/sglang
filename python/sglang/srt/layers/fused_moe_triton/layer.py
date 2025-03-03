@@ -45,6 +45,12 @@ class Task:
     x_remote_cpu: torch.Tensor
     topk_weights_remote_cpu: torch.Tensor
     topk_ids_remote_cpu: torch.Tensor
+    
+@dataclass
+class TaskResult:
+    task_id: int
+    layer_id: int
+    cpu_result: torch.Tensor
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
@@ -84,7 +90,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             # print("Received stop signal, exiting worker process")
             break  # Stop the worker when None is received
         start_time = time.time()
-        print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
+        # print(f"[Offload Worker] task {task.task_id} received at time {time.time()}", flush=True)
         # Perform CPU computation
         cpu_result = fused_experts_cpu_impl(
             hidden_states=task.x_remote_cpu,
@@ -100,14 +106,13 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             print(f"Result queue is full, failed to put task {task.task_id}")
             pass
         else:
-            print(f"Offload task {task.task_id} completed at time {time.time()}")
-            result_queue.put((task.task_id, cpu_result))
-            complete_token_manager.update_token(task.task_id, task.layer_id)
+            task_result = TaskResult(task.task_id, task.layer_id, cpu_result)
+            result_queue.put(task_result)
 
         # except Exception as e:
         #     print(f"Error in CPU offloading worker: {e}")
         end_time = time.time()
-        print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds")
+        # print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds", flush=True)
 
 @register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -184,6 +189,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Start the worker process for CPU offloading
         self.w13_cpu = w13_weight.cpu()  # Simulate CPU expert weights
         self.w2_cpu = w2_weight.cpu()  # Simulate CPU expert weights
+        
+        self.unfinished_tasks = []
 
     
     def update_experts(
@@ -444,23 +451,33 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             fetched_residuals = []
             fetched_forward_batch = []
             device = x_local.device
-            time.sleep(0.025)
+            time.sleep(0.01)
             finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
+
+            # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
             self.retrieve_results()
             while not x_local.numel() and len(finished_tasks)<int(num_seqs*0.9)+1:
+                time.sleep(0.01)
                 self.round_id += 1
                 # stall here if x_local is empty and no remote tasks are finished
                 finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
+                # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
                 self.retrieve_results()
-                time.sleep(0.025)
-                print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] Waiting for remote tasks to finish")
+                
+            finished_tasks.extend(self.unfinished_tasks)
+            self.unfinished_tasks = []
             for key in finished_tasks:
-                try:
-                    cpu_result = self.cpu_buffer[key]
-                except KeyError as e:
-                    assert False, (f"Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
+                if key not in self.cpu_buffer:
+                    self.unfinished_tasks.append(key)
+                    # print(f"[Layer {self.layer_id}] Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}", flush=True)
+                    continue
+                # try:
+                #     cpu_result = self.cpu_buffer[key]
+                # except KeyError as e:
+                #     assert False, (f"[Time {time.time()}] Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
                 # print(f"[Task {key}] finished at {time.time()}")
                 # with torch.cuda.stream(self.stream_gpu):
+                cpu_result = self.cpu_buffer[key]
                 gpu_result = cpu_result[0].to(device)
                 residual_gpu = cpu_result[1].to(device) if cpu_result[1] is not None else None
                 forward_batch_remote = cpu_result[2]
@@ -470,7 +487,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
                 del self.cpu_buffer[key]
             
-            finished_tasks.clear()
 
             if len(fetched_cpu_results) > 0:
                 print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
@@ -506,11 +522,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if self.result_queue.empty():
             print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
         while not self.result_queue.empty():
-            task_id, cpu_result = self.result_queue.get()
-            residual_remote_cpu, forward_batch_remote = self.task_metadata[task_id]
-            self.cpu_buffer[task_id] = cpu_result, residual_remote_cpu, forward_batch_remote
+            task_result = self.result_queue.get()
+            self.complete_token_manager.update_token(task_result.task_id, task_result.layer_id)
+            # print(f"Offload task {task_result.task_id} completed at time {time.time()}", flush=True)
+            
+            residual_remote_cpu, forward_batch_remote = self.task_metadata[task_result.task_id]
+            self.cpu_buffer[task_result.task_id] = task_result.cpu_result, residual_remote_cpu, forward_batch_remote
             # remove the task metadata
-            del self.task_metadata[task_id]
+            del self.task_metadata[task_result.task_id]
             # print(f"[layer {self.layer_id}] Task {task_id} retrieved at {time.time()}")
 
     def __del__(self):

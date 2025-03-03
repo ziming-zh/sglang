@@ -193,7 +193,7 @@ class ModelRunner:
         config=self.model.config
         
         self.task_queue = mp.Queue(maxsize=1000)
-        self.result_queue = [mp.Queue(maxsize=1000) for _ in range(config.num_hidden_layers)]
+        self.result_queue = [mp.Queue(maxsize=1000//config.num_hidden_layers) for _ in range(config.num_hidden_layers)]
         
         self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
         self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
