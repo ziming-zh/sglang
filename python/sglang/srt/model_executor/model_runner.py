@@ -187,7 +187,7 @@ class ModelRunner:
        
         # Create a queue for offloading tasks and a queue for results
         
-        import multiprocessing as mp
+        import torch.multiprocessing as mp
         from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
         
         config=self.model.config

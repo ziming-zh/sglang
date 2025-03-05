@@ -17,7 +17,7 @@
 """Inference-only Mixtral model."""
 
 from typing import Iterable, Optional, Tuple
-
+import time
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -291,6 +291,7 @@ class MixtralDecoderLayer(nn.Module):
         # Self Attention
         # quit if hidden_states and residual are empty
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        forward_decode_start = time.time()
         if hidden_states.numel() == 0 and residual.numel() == 0:
             # print(f"[Mixtral layer {self.layer_id}]Both hidden states and residual are empty")
             assert False, "Both hidden states and residual are empty"
@@ -327,7 +328,8 @@ class MixtralDecoderLayer(nn.Module):
         # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        
+        forward_decode_end = time.time()
+        print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
         return hidden_states, residual, forward_batch
 
 

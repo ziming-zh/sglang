@@ -29,7 +29,7 @@ else:
     fused_experts = None  # type: ignore
 
 import logging
-import multiprocessing as mp
+import torch.multiprocessing as mp
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +90,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             # print("Received stop signal, exiting worker process")
             break  # Stop the worker when None is received
         start_time = time.time()
-        # print(f"[Offload Worker] task {task.task_id} received at time {time.time()}", flush=True)
+        print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
         # Perform CPU computation
         cpu_result = fused_experts_cpu_impl(
             hidden_states=task.x_remote_cpu,
@@ -98,7 +98,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
             w2=w2_cpu,
             topk_weights=task.topk_weights_remote_cpu,
             topk_ids=task.topk_ids_remote_cpu,
-        )
+        ).share_memory_()
 
         # Store the result in a shared queue
         result_queue = result_queue_list[task.layer_id]
@@ -112,7 +112,7 @@ def cpu_offload_worker(task_queue, result_queue_list, complete_token_manager, w1
         # except Exception as e:
         #     print(f"Error in CPU offloading worker: {e}")
         end_time = time.time()
-        # print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds", flush=True)
+        print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds")
 
 @register_custom_op("sglang_unquantized_fused_moe")
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -341,6 +341,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         task_queue: Optional[mp.Queue] = None,
         result_queue: Optional[mp.Queue] = None,
     ) -> torch.Tensor:
+        forward_cuda_start = time.time()
         self.round_id += 1
         topk_weights, topk_ids, is_remote_toks = layer.select_experts(
             hidden_states=x,
@@ -383,6 +384,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             residual_local = None
 
         if is_decode_mode:
+            
+            # split
+            split_start = time.time()
+            
+            
             # Buffer x_remote to avoid small CPU offloads
             if not hasattr(self, "remote_forward_batch") or self.remote_forward_batch is None:
                 self.remote_buffer = []
@@ -418,7 +424,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     # Store in lookup dictionary instead of passing to task_queue
                     self.task_metadata[task_id] = (residual_remote_cpu, forward_batch_remote)
                     
-                    task = Task(task_id, self.layer_id, x_remote_cpu, topk_weights_remote_cpu, topk_ids_remote_cpu)
+                    task = Task(task_id, self.layer_id, x_remote_cpu.share_memory_(), topk_weights_remote_cpu.share_memory_(), topk_ids_remote_cpu.share_memory_())
                     self.task_queue.put(task)
 
                     # Submit task to worker process (without residual_remote_cpu and forward_batch_remote)
@@ -429,7 +435,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # Clear buffer
                 self.remote_buffer = []
                 self.remote_forward_batch = None
-        
+            
+            split_end = time.time()
+            print(f"[Layer {self.layer_id}] Split remote tokens from {split_start} to {split_end} in {split_end-split_start} seconds")
+            
         # do computation on GPU
         x_local = fused_experts(
             hidden_states=x_local,
@@ -446,23 +455,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             
             # print("[FORWARD_CUDA] local input shape", x_local.shape, x_local.device)
             
+            # retrieval
+            retrieval_start = time.time()
+            
             # Check for completed CPU computations and move back to GPU
             fetched_cpu_results = []
             fetched_residuals = []
             fetched_forward_batch = []
             device = x_local.device
-            time.sleep(0.01)
+            self.retrieve_results()
             finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
 
             # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
-            self.retrieve_results()
+            self.retrieve_results(block=False)
             while not x_local.numel() and len(finished_tasks)<int(num_seqs*0.9)+1:
-                time.sleep(0.01)
                 self.round_id += 1
+                self.retrieve_results()
                 # stall here if x_local is empty and no remote tasks are finished
                 finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
                 # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
-                self.retrieve_results()
+                self.retrieve_results(block=False)
+            
+            retrieval_end = time.time()
+            print(f"[Layer {self.layer_id}] Retrieved results from {retrieval_start} to {retrieval_end} in {retrieval_end-retrieval_start} seconds")
+            # combination
+            # combination_start = time.time()
                 
             finished_tasks.extend(self.unfinished_tasks)
             self.unfinished_tasks = []
@@ -505,7 +522,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             
             # forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
             # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
-
+            # combination_end = time.time()
+            # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Combination time: {combination_end-combination_start} seconds")
+        forward_cuda_end = time.time()
+        print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")
         return x_local, residual_local, forward_batch_local
 
     def forward_cpu(self, *args, **kwargs):
@@ -514,15 +534,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
     
-    def retrieve_results(self):
+    def retrieve_results(self, block=True, timeout = 0.01):
         """
         Retrieve results from the worker process.
         Should be called periodically to check for completed tasks.
         """
-        if self.result_queue.empty():
-            print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
-        while not self.result_queue.empty():
-            task_result = self.result_queue.get()
+        # if self.result_queue.empty():
+        #     print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
+        # while not self.result_queue.empty():
+        try:
+            task_result = self.result_queue.get(block=block, timeout=timeout)
+        except Exception:
+            return
+        if task_result is not None:
             self.complete_token_manager.update_token(task_result.task_id, task_result.layer_id)
             # print(f"Offload task {task_result.task_id} completed at time {time.time()}", flush=True)
             
