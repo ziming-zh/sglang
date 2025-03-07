@@ -58,7 +58,7 @@ def cpu_offload_worker(task_pipe):
             topk_ids, topk_ids_shm = load_shared_memory_tensor(task.topk_ids_shm_name, task.topk_ids_shape, task.topk_ids_dtype)
 
             # Perform CPU computation (in-place update on x_remote_cpu)
-            x_remote_cpu.mul_(2)  # Modify in-place
+            # x_remote_cpu.mul_(2)  # Modify in-place
 
             task_end = time.time()
             print(f"[Worker] Task {task.task_id} completed at {task_end}")
@@ -66,7 +66,7 @@ def cpu_offload_worker(task_pipe):
             # Notify the main process that computation is done
             task_pipe.send((task.task_id, task_start, task_end))
 
-            # Cleanup: Only close, DO NOT unlink in the worker
+            # Cleanup: Close shared memory objects
             x_shm.close()
             topk_weights_shm.close()
             topk_ids_shm.close()
@@ -76,7 +76,7 @@ def cpu_offload_worker(task_pipe):
         task_pipe.close()
 
 def main():
-
+    mp.set_start_method("fork")
     num_tasks = 10
     parent_task_pipe, child_task_pipe = mp.Pipe()
 
@@ -148,7 +148,10 @@ def main():
         print(f"Task {task_id}: Sent at {timestamps['task_sent']}, "
               f"Started at {timestamps['task_start']}, Ended at {timestamps['task_end']}, "
               f"Received at {timestamps['task_received']}, "
-              f"Total round-trip latency: {timestamps['task_received'] - timestamps['task_sent']:.4f}s")
+              f"Total round-trip latency: {timestamps['task_received'] - timestamps['task_sent']:.4f}s"
+              f"Sent latency: {timestamps['task_start'] - timestamps['task_sent']:.4f}s "
+                f"Compute latency: {timestamps['task_end'] - timestamps['task_start']:.4f}s "
+                f"Recv latency: {timestamps['task_received'] - timestamps['task_end']:.4f}s ")
 
 if __name__ == "__main__":
     main()
