@@ -192,20 +192,26 @@ class ModelRunner:
         
         config=self.model.config
         
-        self.task_queue = mp.Queue(maxsize=1000)
-        self.result_queue = [mp.Queue(maxsize=1000//config.num_hidden_layers) for _ in range(config.num_hidden_layers)]
+        # self.task_queue = mp.Queue(maxsize=1000)
+        # self.result_queue = [mp.Queue(maxsize=1000//config.num_hidden_layers) for _ in range(config.num_hidden_layers)]
+        self.task_metadata = [{} for _ in range(config.num_hidden_layers)]
+        self.cpu_result_buffer = [{} for _ in range(config.num_hidden_layers)]
         
         self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
         self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
         
-        self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.complete_token_manager, self.w13_cpu, self.w2_cpu))
+        parent_task_pipe, child_task_pipe = mp.Pipe()
+        
+        self.worker_process = mp.Process(target=cpu_offload_worker, args=(child_task_pipe, self.complete_token_manager, self.w13_cpu, self.w2_cpu))
         self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
         self.worker_process.start()
         
-        for layer_id, layer in enumerate(self.model.model.layers):
-            layer.task_queue = self.task_queue
-            layer.result_queue = self.result_queue[layer_id]
+        for layer in self.model.model.layers:
+            layer.parent_task_pipe = parent_task_pipe
+            layer.child_task_pipe = child_task_pipe
             layer.block_sparse_moe.experts.quant_method.complete_token_manager = self.complete_token_manager
+            layer.task_metadata = self.task_metadata
+            layer.cpu_result_buffer = self.cpu_result_buffer
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")

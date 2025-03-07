@@ -96,7 +96,7 @@ class MixtralMoE(nn.Module):
         )
         self.swap_experts=True
        
-    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, task_queue=None, result_queue=None):
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, parent_task_pipe=None, task_metadata=None, cpu_result_buffer=None):
         if(self.swap_experts==True):
             # print("[Testing]Swapping experts")
             import time
@@ -121,7 +121,7 @@ class MixtralMoE(nn.Module):
         
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, task_queue=task_queue, result_queue=result_queue)
+        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=parent_task_pipe, task_metadata=task_metadata, cpu_result_buffer=cpu_result_buffer)
         # print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
         
         # print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
@@ -324,7 +324,7 @@ class MixtralDecoderLayer(nn.Module):
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, task_queue=self.task_queue, result_queue=self.result_queue)
+        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=self.parent_task_pipe, task_metadata=self.task_metadata, cpu_result_buffer=self.cpu_result_buffer)
         # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")

@@ -449,8 +449,8 @@ def launch_engine(
             tp_size_per_node * server_args.node_rank,
             tp_size_per_node * (server_args.node_rank + 1),
         )
-        manager = mp.Manager()
-        complete_token_manager = CompleteTokenQueryService(tp_rank_range.stop, manager)
+        # manager = mp.Manager()
+        complete_token_manager = CompleteTokenQueryService(tp_rank_range.stop)
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
