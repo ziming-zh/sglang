@@ -329,7 +329,7 @@ class MixtralDecoderLayer(nn.Module):
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         forward_decode_end = time.time()
-        print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
         return hidden_states, residual, forward_batch
 
 
