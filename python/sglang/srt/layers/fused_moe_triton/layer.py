@@ -50,6 +50,17 @@ class FusedMoeWeightScaleSupported(Enum):
     CHANNEL = "channel"
     GROUP = "group"
 
+class TaskCounter:
+    def __init__(self):
+        self.task_count = 1
+
+    def get_task_id(self):
+        self.task_count += 1
+        if self.task_count > 999:
+            self.task_count = 1
+        return self.task_count
+    
+task_counter = TaskCounter()
 
 @dataclass
 class Task:
@@ -465,7 +476,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU, cuda {x_remote.device}")
                 
                 # generate a unique task ID
-                task_id = random.randint(1, 999)
+                # task_id = random.randint(1, 999)
+                task_id = task_counter.get_task_id()
+
                 print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
 
                 with torch.cuda.stream(self.stream_cpu):
