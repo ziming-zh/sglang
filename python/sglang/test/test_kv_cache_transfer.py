@@ -143,9 +143,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 def run_test(
     layer_num = 32,
     stride_num = 8,
-    head_num = 2,
+    head_num = 4,
     head_dim = 128,
-    size = 29725,
+    size = 297250,
     dtype = torch.bfloat16,
     num_gpus = 8,
 ):
@@ -211,8 +211,8 @@ def parallel_exchange(source_pools, target_pools, stride_num):
 
 def run_parallel_test(
     layer_num = 32,
-    stride_num = 4,
-    head_num = 2,
+    stride_num = 8,
+    head_num = 4,
     head_dim = 128,
     size = 29725,
     dtype = torch.bfloat16,
@@ -271,7 +271,7 @@ def run_parallel_test(
     
 def run_parallel_test_cpu(
     layer_num = 32,
-    stride_num = 4,
+    stride_num = 8,
     head_num = 2,
     head_dim = 128,
     size = 29725,
