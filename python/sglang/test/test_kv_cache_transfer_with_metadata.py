@@ -68,10 +68,9 @@ def swap_inactive_requests(
                 spans.append((i, start, end))
         return spans
 
-    k1, v1 = pool1.k_buffer[layer_id], pool1.v_buffer[layer_id]
-    k2, v2 = pool2.k_buffer[layer_id], pool2.v_buffer[layer_id]
+    k1_list, v1_list = pool1.k_buffer[layer_id:layer_id + stride_num], pool1.v_buffer[layer_id:layer_id + stride_num]
+    k2_list, v2_list = pool2.k_buffer[layer_id:layer_id + stride_num], pool2.v_buffer[layer_id:layer_id + stride_num]
 
-    dev1, dev2 = k1.device, k2.device
 
     spans_1 = collect_spans(start_locs_1, is_active_1, end_loc_1)
     spans_2 = collect_spans(start_locs_2, is_active_2, end_loc_2)
@@ -79,40 +78,41 @@ def swap_inactive_requests(
     # Flatten and concatenate all inactive chunks
     def flatten_spans(tensor, spans):
         return torch.cat([tensor[start:end] for _, start, end in spans], dim=0)
+    for k1, v1, k2, v2 in zip(k1_list, v1_list, k2_list, v2_list):
+        dev1, dev2 = k1.device, k2.device
+        k1_chunks = flatten_spans(k1, spans_1)
+        v1_chunks = flatten_spans(v1, spans_1)
+        k2_chunks = flatten_spans(k2, spans_2)
+        v2_chunks = flatten_spans(v2, spans_2)
+        print(f"Inactive chunks: {len(k1_chunks)}, {len(k2_chunks)}")
 
-    k1_chunks = flatten_spans(k1, spans_1)
-    v1_chunks = flatten_spans(v1, spans_1)
-    k2_chunks = flatten_spans(k2, spans_2)
-    v2_chunks = flatten_spans(v2, spans_2)
-    print(f"Inactive chunks: {len(k1_chunks)}, {len(k2_chunks)}")
+        # Swap chunks
+        k1_new = k2_chunks.to(dev1, non_blocking=True)
+        v1_new = v2_chunks.to(dev1, non_blocking=True)
+        k2_new = k1_chunks.to(dev2, non_blocking=True)
+        v2_new = v1_chunks.to(dev2, non_blocking=True)
 
-    # Swap chunks
-    k1_new = k2_chunks.to(dev1, non_blocking=True)
-    v1_new = v2_chunks.to(dev1, non_blocking=True)
-    k2_new = k1_chunks.to(dev2, non_blocking=True)
-    v2_new = v1_chunks.to(dev2, non_blocking=True)
+        # Append to tail
+        new_start_locs_1 = start_locs_1.copy()
+        new_start_locs_2 = start_locs_2.copy()
+        curr1 = end_loc_1 - len(k1_chunks)
+        curr2 = end_loc_2 - len(k2_chunks)
+        
+        print(f"k1 shape: {k1.shape}, k2 shape: {k2.shape}")
+        print(f"v1 shape: {v1.shape}, v2 shape: {v2.shape}")
+        print(f"curr1: {curr1}, curr2: {curr2}")
 
-    # Append to tail
-    new_start_locs_1 = start_locs_1.copy()
-    new_start_locs_2 = start_locs_2.copy()
-    curr1 = end_loc_1 - len(k1_chunks)
-    curr2 = end_loc_2 - len(k2_chunks)
-    
-    print(f"k1 shape: {k1.shape}, k2 shape: {k2.shape}")
-    print(f"v1 shape: {v1.shape}, v2 shape: {v2.shape}")
-    print(f"curr1: {curr1}, curr2: {curr2}")
+        if k1_new.numel() > 0:
+            k1[curr1:curr1 + k1_new.shape[0]].copy_(k1_new)
+            v1[curr1:curr1 + v1_new.shape[0]].copy_(v1_new)
+            # new_start_locs_1.extend(range(curr1, curr1 + k1_new.shape[0], 200))
+            # curr1 += k1_new.shape[0]
 
-    if k1_new.numel() > 0:
-        k1[curr1:curr1 + k1_new.shape[0]].copy_(k1_new)
-        v1[curr1:curr1 + v1_new.shape[0]].copy_(v1_new)
-        new_start_locs_1.extend(range(curr1, curr1 + k1_new.shape[0], 200))
-        curr1 += k1_new.shape[0]
-
-    if k2_new.numel() > 0:
-        k2[curr2:curr2 + k2_new.shape[0]].copy_(k2_new)
-        v2[curr2:curr2 + v2_new.shape[0]].copy_(v2_new)
-        new_start_locs_2.extend(range(curr2, curr2 + k2_new.shape[0], 200))
-        curr2 += k2_new.shape[0]
+        if k2_new.numel() > 0:
+            k2[curr2:curr2 + k2_new.shape[0]].copy_(k2_new)
+            v2[curr2:curr2 + v2_new.shape[0]].copy_(v2_new)
+            # new_start_locs_2.extend(range(curr2, curr2 + k2_new.shape[0], 200))
+            # curr2 += k2_new.shape[0]
 
     return curr1, curr2, new_start_locs_1, new_start_locs_2
 
