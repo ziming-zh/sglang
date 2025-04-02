@@ -7,10 +7,60 @@ import random
 
 
 class BaseTokenToKVPool:
-    def __init__(self, size, dtype, device):
-        self.store_dtype = dtype
-        self.device = device
+    """A memory pool that maps a token location to its kv cache data."""
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
         self.size = size
+        self.dtype = dtype
+        if dtype == torch.float8_e5m2:
+            # NOTE: Store as torch.uint8 because Tensor index_put is not implemented for torch.float8_e5m2
+            self.store_dtype = torch.uint8
+        else:
+            self.store_dtype = dtype
+        self.device = device
+
+        self.free_slots = None
+        self.is_not_in_free_group = True
+        self.free_group = []
+        self.clear()
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int):
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index.to(self.device, non_blocking=True)
+
+    def free(self, free_index: torch.Tensor):
+        if self.is_not_in_free_group:
+            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.concat(self.free_group))
+
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
+        self.is_in_free_group = False
+        self.free_group = []
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
