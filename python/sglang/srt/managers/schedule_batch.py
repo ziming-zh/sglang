@@ -532,6 +532,9 @@ class ScheduleBatch:
     # inactive request cache
     inactive_reqs_batch = None
     rid_list: List[str] = None
+    
+    expected_batch_size: int = 60
+    cached_reqs: List[Req] = None
 
     @classmethod
     def init_new(
@@ -978,9 +981,78 @@ class ScheduleBatch:
         self.input_ids = self.output_ids
         self.output_ids = None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
+        if self.cached_reqs is None:
+            self.cached_reqs = []
+            self.cached_req_pool_indices = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_seq_lens = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_input_ids = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_input_embeds = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            
 
         # Alloc mem
         bs = len(self.reqs)
+        if bs > self.expected_batch_size:
+            # put the extra things into the request cache
+            self.cached_reqs.extend(self.reqs[self.expected_batch_size :])
+            self.reqs = self.reqs[: self.expected_batch_size]
+            
+            self.cached_req_pool_indices = torch.cat(
+                [self.cached_req_pool_indices, self.req_pool_indices[self.expected_batch_size :]]
+            )
+            
+            self.cached_seq_lens = torch.cat(
+                [self.cached_seq_lens, self.seq_lens[self.expected_batch_size :]]
+            )
+            self.cached_input_ids = torch.cat(
+                [self.input_ids, self.req_pool_indices[self.expected_batch_size :]]
+            )
+            if self.input_embeds is not None:
+                self.cached_input_embeds = torch.cat(   
+                    [self.input_embeds, self.input_embeds[self.expected_batch_size :]]
+                )
+            self.req_pool_indices = self.req_pool_indices[: self.expected_batch_size]
+            self.seq_lens = self.seq_lens[: self.expected_batch_size]
+            self.input_ids = self.input_ids[: self.expected_batch_size]
+            if self.input_embeds is not None:
+                self.input_embeds = self.input_embeds[: self.expected_batch_size]
+            self.seq_lens_sum = self.seq_lens.sum().item()
+            bs = len(self.reqs)
+        elif bs < self.expected_batch_size:
+            if len(self.cached_reqs) > 0:
+                size_gap = self.expected_batch_size - bs
+                self.reqs.extend(self.cached_reqs[: size_gap])
+                self.cached_reqs = self.cached_reqs[size_gap :]
+                
+                self.req_pool_indices = torch.cat(
+                    [self.req_pool_indices, self.cached_req_pool_indices[: size_gap]]
+                )
+                self.cached_req_pool_indices = self.cached_req_pool_indices[size_gap :]
+                self.seq_lens = torch.cat(
+                    [self.seq_lens, self.cached_seq_lens[: size_gap]]
+                )
+                self.cached_seq_lens = self.cached_seq_lens[size_gap :]
+                self.input_ids = torch.cat(
+                    [self.input_ids, self.cached_input_ids[: size_gap]]
+                )
+                self.cached_input_ids = self.cached_input_ids[size_gap :]
+                if self.input_embeds is not None:
+                    self.cached_input_embeds = torch.cat(
+                        [self.cached_input_embeds, self.input_embeds[: size_gap]]
+                    )
+                    self.input_embeds = self.input_embeds[size_gap :]
+                    
+                self.seq_lens_sum = self.seq_lens.sum().item()
+                
+                bs = len(self.reqs)
+        
         print(f"Allocating {bs} tokens for decoding")
         # print(f"[REQS] {self.reqs}")
         self.out_cache_loc = self.alloc_token_slots(bs)
