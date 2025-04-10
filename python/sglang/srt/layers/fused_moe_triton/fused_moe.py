@@ -421,25 +421,25 @@ def fused_topk(
         token_expert_indicies,
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
-    del token_expert_indicies  # Not used. Will be used in the future.
-    
-    # Find indices where topk_ids >= 4
-    mask_4 = topk_ids >= 4
+    prune_topk = 2
+    # Find indices where topk_ids >= topk
+    mask_4 = topk_ids >= prune_topk
     indices_to_change = mask_4.nonzero(as_tuple=True)
 
     if is_decode_mode:
         num_to_change = int(mask_4.sum() * 19 / 20)  # Compute 19/20 of occurrences
 
         if num_to_change > 0:
-            # Sort indices lexicographically for deterministic selection
-            sorted_indices = torch.argsort(indices_to_change[0] * topk + indices_to_change[1])
+            # Shuffle the indices randomly but deterministically
+            rand_perm = torch.randperm(len(indices_to_change[0]), generator=torch.Generator().manual_seed(42))
 
             # Select the first num_to_change elements
-            selected_indices = sorted_indices[:num_to_change]
-            topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] -= 4
+            selected_indices = rand_perm[:num_to_change]
+            topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] = topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] % prune_topk
     else:
-        topk_ids[mask_4] -= 4
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
 
+    del token_expert_indicies  # Not used. Will be used in the future.
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 

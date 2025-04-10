@@ -188,6 +188,32 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             if value is not None:  # logit_bias can be None
                 setattr(self, item, value[new_indices])
+                
+    def merge_batch(self, other: "SamplingBatchInfo"):
+        """Merge another SamplingBatchInfo instance into the current one."""
+        if not isinstance(other, SamplingBatchInfo):
+            raise ValueError("Argument must be an instance of SamplingBatchInfo")
+        
+        for item in [
+            "temperatures",
+            "top_ps",
+            "top_ks",
+            "min_ps",
+        ]:
+            value_self = getattr(self, item, None)
+            value_other = getattr(other, item, None)
+            if value_self is not None and value_other is not None:
+                setattr(self, item, torch.cat([value_self, value_other], dim=0))
+            elif value_other is not None:
+                setattr(self, item, value_other.clone())
+        
+        if self.logit_bias is not None and other.logit_bias is not None:
+            self.logit_bias = torch.cat([self.logit_bias, other.logit_bias], dim=0)
+        elif other.logit_bias is not None:
+            self.logit_bias = other.logit_bias.clone()
+        
+        if hasattr(self.penalizer_orchestrator, "merge") and hasattr(other.penalizer_orchestrator, "merge"):
+            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
     @staticmethod
     def merge_bias_tensor(

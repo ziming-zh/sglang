@@ -161,6 +161,7 @@ class PrefillAdder:
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            print(f"[NO_TOKEN BUDGET] {self.rem_total_tokens=} {self.cur_rem_tokens=}")
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0 or (
@@ -253,6 +254,9 @@ class PrefillAdder:
             )
             bs = len(self.req_states) - i
             if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
+                print(
+                    f"[NO_TOKEN 2] {cur_rem_tokens=} {tokens_freed=} {decode_steps=} {bs=}"
+                )
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
@@ -291,6 +295,7 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            print(f"[NO_TOKEN 0] {total_tokens=} {self.rem_total_tokens=}")
             return AddReqResult.NO_TOKEN
 
         if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -298,6 +303,7 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             if total_tokens > self.rem_total_tokens:
+                print(f"[NO_TOKEN 1] {total_tokens=} {self.rem_total_tokens=}")
                 return AddReqResult.NO_TOKEN
 
             if (
