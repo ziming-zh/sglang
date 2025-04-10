@@ -1012,7 +1012,7 @@ class ScheduleBatch:
                 [self.cached_seq_lens, self.seq_lens[self.expected_batch_size :]]
             )
             self.cached_input_ids = torch.cat(
-                [self.input_ids, self.req_pool_indices[self.expected_batch_size :]]
+                [self.cached_input_ids, self.input_ids[self.expected_batch_size :]]
             )
             if self.input_embeds is not None:
                 self.cached_input_embeds = torch.cat(   
@@ -1044,10 +1044,10 @@ class ScheduleBatch:
                 )
                 self.cached_input_ids = self.cached_input_ids[size_gap :]
                 if self.input_embeds is not None:
-                    self.cached_input_embeds = torch.cat(
-                        [self.cached_input_embeds, self.input_embeds[: size_gap]]
+                    self.input_embeds = torch.cat(
+                        [self.input_embeds, self.cached_input_embeds[: size_gap]]
                     )
-                    self.input_embeds = self.input_embeds[size_gap :]
+                    self.cached_input_embeds = self.cached_input_embeds[size_gap :]
                     
                 self.seq_lens_sum = self.seq_lens.sum().item()
                 
