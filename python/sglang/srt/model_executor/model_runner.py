@@ -209,6 +209,7 @@ class ModelRunner:
         for layer in self.model.model.layers:
             layer.parent_task_pipe = parent_task_pipe
             layer.child_task_pipe = child_task_pipe
+            layer.block_sparse_moe.experts.complete_token_manager = self.complete_token_manager
             layer.block_sparse_moe.experts.quant_method.complete_token_manager = self.complete_token_manager
             layer.task_metadata = self.task_metadata
             layer.cpu_result_buffer = self.cpu_result_buffer

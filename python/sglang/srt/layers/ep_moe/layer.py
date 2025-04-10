@@ -1,6 +1,10 @@
+from dataclasses import dataclass
 import logging
+from multiprocessing.shared_memory import SharedMemory
+import time
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
@@ -11,6 +15,7 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 
+from python.sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.ep_moe.kernels import (
     grouped_gemm_triton,
@@ -29,6 +34,206 @@ from sglang.srt.utils import is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
+class TaskCounter:
+    def __init__(self):
+        self.task_count = 1
+
+    def get_task_id(self):
+        self.task_count += 1
+        if self.task_count > 999:
+            self.task_count = 1
+        return self.task_count
+    
+task_counter = TaskCounter()
+
+
+@dataclass
+class Task:
+    task_id: int
+    layer_id: int
+    x_shm_name: str
+    x_shape: tuple
+    x_dtype: torch.dtype
+    topk_weights_shm_name: str
+    topk_weights_shape: tuple
+    topk_weights_dtype: torch.dtype
+    topk_ids_shm_name: str
+    topk_ids_shape: tuple
+    topk_ids_dtype: torch.dtype
+    
+@dataclass
+class TaskResult:
+    task_id: int
+    layer_id: int
+    cpu_result_name: str
+    cpu_result_shape: tuple
+    cpu_result_dtype: torch.dtype
+
+TORCH_TO_NUMPY_DTYPE = {
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.uint8: np.uint8,
+    torch.bool: np.bool_,
+    torch.bfloat16: np.float32  # Store bfloat16 as float32
+}
+
+def create_shared_memory_tensor(tensor):
+    """Create shared memory and store a tensor in it."""
+    # Convert bfloat16 to float32 before storing
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.to(torch.float32)
+    
+    shm = SharedMemory(create=True, size=tensor.numel() * tensor.element_size())
+    np_array = np.ndarray(tensor.shape, dtype=TORCH_TO_NUMPY_DTYPE[tensor.dtype], buffer=shm.buf)
+    np_array[:] = tensor.numpy()  # Copy tensor data into shared memory
+    return shm
+
+def load_shared_memory_tensor(shm_name, shape, dtype):
+    """Load a tensor from shared memory."""
+    np_dtype = TORCH_TO_NUMPY_DTYPE[dtype]  # Convert torch dtype to numpy dtype
+    shm = SharedMemory(name=shm_name)
+    np_array = np.ndarray(shape, dtype=np_dtype, buffer=shm.buf)
+
+    # Convert float32 back to bfloat16 if needed
+    if dtype == torch.bfloat16:
+        return torch.tensor(np_array, dtype=torch.float32).to(torch.bfloat16), shm
+    return torch.tensor(np_array, dtype=dtype), shm
+
+
+def cpu_offload_worker(task_pipe, complete_token_manager, w13_cpu, w2_cpu):
+    """
+    Worker function that runs in a separate process to handle CPU offloading.
+    """
+    while True:
+        # try:
+        # print(f"Worker process waiting for task")
+        task = task_pipe.recv()
+        # print(f"Worker process received task {task.task_id}")
+        if task is None:
+            # print("Received stop signal, exiting worker process")
+            break  # Stop the worker when None is received
+        start_time = time.time()
+        print(f"[Offload Worker] task {task.task_id} received at time {time.time()}")
+        
+        # Load all tensors from shared memory
+        x_remote_cpu, x_shm = load_shared_memory_tensor(task.x_shm_name, task.x_shape, task.x_dtype)
+        topk_weights, topk_weights_shm = load_shared_memory_tensor(task.topk_weights_shm_name, task.topk_weights_shape, task.topk_weights_dtype)
+        topk_ids, topk_ids_shm = load_shared_memory_tensor(task.topk_ids_shm_name, task.topk_ids_shape, task.topk_ids_dtype)
+        
+        # Perform CPU computation
+        cpu_result = fused_experts_cpu_impl(
+            hidden_states=x_remote_cpu,
+            w13=w13_cpu,
+            w2=w2_cpu,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        
+        cpu_result_shm = create_shared_memory_tensor(cpu_result)
+
+        # if result_queue.full():
+        #     print(f"Result queue is full, failed to put task {task.task_id}")
+        #     pass
+        # else:
+        #     task_result = TaskResult(task.task_id, task.layer_id, cpu_result)
+        #     result_queue.put(task_result)
+        
+        task_result = TaskResult(task.task_id, task.layer_id, cpu_result_shm.name, cpu_result.shape, cpu_result.dtype)
+        task_pipe.send(task_result)
+        
+        # Cleanup shared memory references
+        x_shm.close()
+        topk_weights_shm.close()
+        topk_ids_shm.close()
+        
+        
+        # except Exception as e:
+        #     print(f"Error in CPU offloading worker: {e}")
+        end_time = time.time()
+        print(f"[Offload Worker] task {task.task_id} completed from {start_time} to {end_time} in {end_time-start_time} seconds")
+
+def fused_experts_cpu_impl(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool = False,
+):
+    """
+    CPU-based implementation of Mixture of Experts (MoE) calculation.
+    
+    Args:
+        hidden_states (torch.Tensor): Input token embeddings [num_tokens, hidden_size].
+        w13 (torch.Tensor): Expert weight matrix for the first layer [E, N, hidden_size].
+        w2 (torch.Tensor): Expert weight matrix for the second layer [E, N, output_size].
+        topk_weights (torch.Tensor): Top-k routing weights [num_tokens, k].
+        topk_ids (torch.Tensor): Top-k expert IDs for each token [num_tokens, k].
+        inplace (bool): If True, modify the hidden_states tensor in place.
+    
+    Returns:
+        torch.Tensor: Output token embeddings after the MoE computation.
+    """
+    # Check dimensions
+    num_tokens, hidden_size = hidden_states.shape
+    E, N, _ = w13.shape
+    assert hidden_states.shape[1] == w13.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "Top-k shape mismatch"
+    
+    k = topk_ids.shape[1]  # Number of selected experts per token
+    output_size = hidden_size  # Output size is same as hidden size
+    
+    # Initialize output
+    out_hidden_states = hidden_states if inplace else torch.zeros(
+        (num_tokens, output_size), device="cpu", dtype=hidden_states.dtype
+    )
+    
+    # # Iterate over tokens to compute MoE outputs
+    # for token_idx in range(num_tokens):
+    #     token_embedding = hidden_states[token_idx]  # [hidden_size]
+    #     token_output = torch.zeros(output_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        
+    #     for expert_rank in range(k):
+    #         expert_id = topk_ids[token_idx, expert_rank].item()%4  # temp: only 4 experts available
+    #         expert_weight = topk_weights[token_idx, expert_rank].item()
+            
+    #         # Fetch expert weights from w13 (merged w1 and w3)
+    #         w1_expert, w3_expert = torch.chunk(w13[expert_id], 2, dim=0)  # [N, hidden_size] each
+    #         w2_expert = w2[expert_id]  # [N, output_size]
+
+    #         # print(f"w1_expert: {w1_expert.shape}, w3_expert: {w3_expert.shape}")
+    #         # print(f"w2_expert: {w2_expert.shape}")
+
+    #         # Compute expert output using GLU mechanism
+    #         intermediate1 = torch.matmul(token_embedding, w1_expert.T)  # [N]
+    #         intermediate2 = torch.matmul(token_embedding, w3_expert.T)  # [N]
+            
+    #         # print(f"intermediate1: {intermediate1.shape}, intermediate2: {intermediate2.shape}")
+
+    #         # Apply SiLU activation and gate using w3
+    #         activated = torch.nn.functional.silu(intermediate1) * intermediate2  
+            
+    #         # print(f"activated: {activated.shape}")
+
+    #         # Compute final expert output
+    #         expert_output = torch.matmul(activated, w2_expert.T)  # [output_size]
+            
+    #         # print(f"expert_output: {expert_output.shape}")
+            
+    #         # print(f"token_output: {token_output.shape}")
+            
+    #         # print(f"expert_weight: {expert_weight}")
+
+    #         # Weighted sum across experts
+    #         token_output += expert_output * expert_weight
+
+        
+    #     # Store the token's output
+    #     out_hidden_states[token_idx] = token_output
+    
+    return out_hidden_states
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -113,9 +318,14 @@ class EPMoE(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        layer_id: Optional[int] = None,
+        available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
-
+        pruned_top_k = 2
+        # self.available_experts = available_experts or [True] * num_experts
+        self.available_experts = available_experts or [True] * pruned_top_k + [False] * (num_experts - pruned_top_k) # temp: only 4 experts available
+        self.num_available_experts = sum(self.available_experts)
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -124,9 +334,10 @@ class EPMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
-        self.num_experts_per_partition = self.num_experts // self.tp_size
+        self.num_experts_per_partition = self.num_available_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
@@ -159,30 +370,138 @@ class EPMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+        self.round_id = 0
+        # set up CUDA streams for async offloading
+        self.stream_cpu = torch.cuda.Stream()
+        self.stream_gpu = torch.cuda.Stream()
+        
 
         self.grouped_gemm_runner = None
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, is_decode_mode: bool, forward_batch: ForwardBatch, residual: Optional[torch.Tensor] = None, parent_task_pipe=None, task_metadata=None, cpu_result_buffer=None):
         assert self.quant_method is not None
+        self.round_id += 1
+        self.task_metadata = task_metadata
+        self.cpu_buffer = cpu_result_buffer
+        self.parent_task_pipe = parent_task_pipe
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
+            
+        forward_cuda_start = time.time()
 
-        topk_weights, topk_ids = self.select_experts(
+        topk_weights, topk_ids, is_remote_toks = self.select_experts(
             hidden_states,
             router_logits,
             self.top_k,
             self.renormalize,
+            is_decode_mode,
             self.topk_group,
             self.num_expert_group,
         )
+        x_remote = hidden_states[is_remote_toks]
+        x_local = hidden_states[~is_remote_toks]
+        num_seqs = hidden_states.shape[0]
+        
+        print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+
+        topk_weights_remote = topk_weights[is_remote_toks]
+        topk_ids_remote = topk_ids[is_remote_toks]
+
+        topk_weights_local = topk_weights[~is_remote_toks]
+        topk_ids_local = topk_ids[~is_remote_toks]
+        if is_decode_mode:
+            forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
+        else:
+            forward_batch_local = forward_batch
+            forward_batch_remote = None
+        
+                    
+        if residual is not None:
+            residual_remote = residual[is_remote_toks]
+            residual_local = residual[~is_remote_toks]
+        else:
+            residual_remote = None
+            residual_local = None
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
-            topk_ids, self.num_experts
+            topk_ids_local, self.num_experts
         )
+        
+        if is_decode_mode:
+            # split
+            split_start = time.time()
+            
+            # Buffer x_remote to avoid small CPU offloads
+            if not hasattr(self, "remote_forward_batch") or self.remote_forward_batch is None:
+                self.remote_buffer = []
+                self.remote_forward_batch_list = []
 
+            if x_remote.numel() > 0:
+                # print(f"Combining {x_remote.numel()} remote tokens, cuda {x_remote.device}")
+                # self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
+                self.remote_forward_batch_list.append(forward_batch_remote)
+                self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
+            # Only offload when buffer size is 20 or more
+            # Offload when buffer size reaches threshold
+            if len(self.remote_buffer) >= 1:
+                # print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU, cuda {x_remote.device}")
+                
+                # generate a unique task ID
+                # task_id = random.randint(1, 999)
+                task_id = task_counter.get_task_id()
+
+                print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
+
+                with torch.cuda.stream(self.stream_cpu):
+                    x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu")
+                    self.remote_forward_batch = forward_batch_remote.combine(self.remote_forward_batch_list[:-1])
+                    # print(f"offload task {task_id} dispatched at time {time.time()}, cuda {x_remote_cpu.device}")
+
+                    topk_weights_remote_cpu = torch.cat([item[1] for item in self.remote_buffer], dim=0).to("cpu")
+                    topk_ids_remote_cpu = torch.cat([item[2] for item in self.remote_buffer], dim=0).to("cpu")
+
+                    if residual_remote is not None:
+                        residual_remote_cpu = torch.cat([item[3] for item in self.remote_buffer], dim=0)
+                    else:
+                        residual_remote_cpu = None
+                        
+                    # Store in lookup dictionary instead of passing to task_queue
+                    self.task_metadata[self.layer_id][task_id] = (residual_remote_cpu, forward_batch_remote)
+                    
+                    # Create shared memory for x_remote_cpu, topk_weights_remote_cpu, topk_ids_remote_cpu
+                    x_shm = create_shared_memory_tensor(x_remote_cpu)
+                    topk_weights_shm = create_shared_memory_tensor(topk_weights_remote_cpu)
+                    topk_ids_shm = create_shared_memory_tensor(topk_ids_remote_cpu)
+                    
+                    # Send task to worker process
+                    task = Task(
+                        task_id=task_id,
+                        layer_id=self.layer_id,
+                        x_shm_name=x_shm.name,
+                        x_shape=x_remote_cpu.shape,
+                        x_dtype=x_remote_cpu.dtype,
+                        topk_weights_shm_name=topk_weights_shm.name,
+                        topk_weights_shape=topk_weights_remote_cpu.shape,
+                        topk_weights_dtype=topk_weights_remote_cpu.dtype,
+                        topk_ids_shm_name=topk_ids_shm.name,
+                        topk_ids_shape=topk_ids_remote_cpu.shape,
+                        topk_ids_dtype=topk_ids_remote_cpu.dtype,
+                    )
+                    parent_task_pipe.send(task)
+                    print(f"Task {task_id} sent to worker process at {time.time()}, cuda {x_remote_cpu.device}")
+                # Clear the buffer
+                self.remote_buffer = []
+                
+                self.remote_forward_batch = None
+            split_end = time.time()
+            print(f"[Layer {self.layer_id}] Splitting remote tokens took {split_end - split_start} seconds")
+    
+        hidden_states = x_local
+        topk_weights = topk_weights_local
+        topk_ids = topk_ids_local
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
@@ -295,14 +614,134 @@ class EPMoE(torch.nn.Module):
             hidden_states.size(1),
             BLOCK_SIZE=512,
         )
-        return output
+        x_local = output
+        
+        if is_decode_mode:
 
+            # retrieve results from the worker process
+            
+            # print("[FORWARD_CUDA] local input shape", x_local.shape, x_local.device)
+            
+            # retrieval
+            retrieval_start = time.time()
+            
+            # Check for completed CPU computations and move back to GPU
+            fetched_cpu_results = []
+            fetched_residuals = []
+            fetched_forward_batch = []
+            device = x_local.device
+            self.retrieve_results()
+            # query_and_retrieve_start = time.time()
+            finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
+
+            # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
+            self.retrieve_results()
+            # query_and_retrieve_end = time.time()
+            # print(f"[Layer {self.layer_id}] Query and retrieve from {query_and_retrieve_start} to {query_and_retrieve_end} in {query_and_retrieve_end-query_and_retrieve_start} seconds")
+            while not x_local.numel() and len(finished_tasks)<int(num_seqs*0.8)+1:
+                time.sleep(0.01)
+                self.round_id += 1
+                self.retrieve_results()
+                # stall here if x_local is empty and no remote tasks are finished
+                finished_tasks.extend(self.complete_token_manager.query(self.round_id, self.layer_id))
+                print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, round: {self.round_id}, finished tasks: {finished_tasks}")
+                self.retrieve_results()
+            
+            retrieval_end = time.time()
+            print(f"[Layer {self.layer_id}] Retrieved results from {retrieval_start} to {retrieval_end} in {retrieval_end-retrieval_start} seconds")
+            # combination
+            # combination_start = time.time()
+                
+
+            for key in finished_tasks:
+                # if key not in self.cpu_buffer:
+                #     self.unfinished_tasks.append(key)
+                #     # print(f"[Layer {self.layer_id}] Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}", flush=True)
+                #     continue
+                # try:
+                #     cpu_result = self.cpu_buffer[key]
+                # except KeyError as e:
+                #     assert False, (f"[Time {time.time()}] Task {key} not found in CPU buffer, keys in buffer: {self.cpu_buffer.keys()}, keys in finished_tasks: {finished_tasks}")
+                # print(f"[Task {key}] finished at {time.time()}")
+                # with torch.cuda.stream(self.stream_gpu):
+                cpu_result = self.cpu_buffer[self.layer_id][key]
+                gpu_result = cpu_result[0].to(device)
+                residual_gpu = cpu_result[1].to(device) if cpu_result[1] is not None else None
+                forward_batch_remote = cpu_result[2]
+                fetched_cpu_results.append(gpu_result)
+                fetched_residuals.append(residual_gpu)
+                fetched_forward_batch.append(forward_batch_remote)
+                # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
+                del self.cpu_buffer[self.layer_id][key]
+            
+
+            if len(fetched_cpu_results) > 0:
+                print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
+                # print(f"fetched_gpu_results: {fetched_cpu_results}")
+                x_local = torch.cat([x_local] + fetched_cpu_results, dim=0)
+                if residual_local is not None:
+                    residual_local = torch.cat([residual_local] + fetched_residuals, dim=0)
+                # print(f"[Combine before] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
+                forward_batch_local.combine(fetched_forward_batch)
+                # print(f"[Combine after] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
+                # synchronize streams
+                torch.cuda.synchronize()
+                    
+            # print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
+            # print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
+            
+            # forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
+            # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
+            # combination_end = time.time()
+            # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Combination time: {combination_end-combination_start} seconds")
+        forward_cuda_end = time.time()
+        print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")
+        return x_local, residual_local, forward_batch_local
+
+    def retrieve_results(self):
+        """
+        Retrieve results from the worker process.
+        Should be called periodically to check for completed tasks.
+        """
+        # if self.result_queue.empty():
+        #     print(f"[layer {self.layer_id}] Result queue is empty at {time.time()}")
+        # while not self.result_queue.empty():
+        # try:
+        #     task_result = self.result_queue.get(block=block, timeout=timeout)
+        # except Exception:
+        #     return
+        
+        if self.parent_task_pipe.poll():
+            task_result = self.parent_task_pipe.recv()
+            
+            print(f"[Layer {self.layer_id}] Task {task_result.task_id} layer {task_result.layer_id} retrieved at {time.time()}")
+        else:
+            return
+            
+        
+        cpu_result, cpu_result_shm = load_shared_memory_tensor(task_result.cpu_result_name, task_result.cpu_result_shape, task_result.cpu_result_dtype)
+        
+        if task_result is not None:
+            self.complete_token_manager.update_token(task_result.task_id, task_result.layer_id)
+            # print(f"Offload task {task_result.task_id} completed at time {time.time()}", flush=True)
+            
+            residual_remote_cpu, forward_batch_remote = self.task_metadata[task_result.layer_id][task_result.task_id]
+            self.cpu_buffer[task_result.layer_id][task_result.task_id] = cpu_result, residual_remote_cpu, forward_batch_remote
+            # remove the task metadata
+            del self.task_metadata[task_result.layer_id][task_result.task_id]
+            # print(f"[layer {self.layer_id}] Task {task_id} retrieved at {time.time()}")
+            
+        # cleanup shared memory
+        cpu_result_shm.close()
+        print(f"[Layer {self.layer_id}] Task {task_result.task_id} retrieved and cleaned up at {time.time()}")
+        
     def select_experts(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
+        is_decode_mode: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
     ):
@@ -316,6 +755,7 @@ class EPMoE(torch.nn.Module):
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                is_decode_mode = is_decode_mode,
             )
         else:
             topk_weights, topk_ids = fused_topk(
@@ -323,8 +763,17 @@ class EPMoE(torch.nn.Module):
                 gating_output=router_logits,
                 topk=top_k,
                 renormalize=renormalize,
+                is_decode_mode = is_decode_mode,
             )
-        return topk_weights, topk_ids.to(torch.int32)
+        is_remote = [False] * len(topk_ids)
+        
+        for token_idx, token_topk_ids in enumerate(topk_ids):
+            for expert_id in token_topk_ids:
+                if not self.available_experts[expert_id]:
+                    # print(f"[WARNING] Token {token_idx} has pruned expert {expert_id}.")
+                    is_remote[token_idx] = True
+        is_remote = torch.tensor(is_remote, device=router_logits.device)
+        return topk_weights, topk_ids.to(torch.int32), is_remote
 
     @classmethod
     def make_expert_params_mapping(
