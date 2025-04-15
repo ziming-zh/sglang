@@ -27,6 +27,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from python.sglang.srt.mem_cache.memory_pool import inactive_swap_wrapper_token_index, parallel_inactive_exchange_token_index
 from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
@@ -229,8 +230,11 @@ class MixtralAttention(nn.Module):
         # check the size of q, k before and after rotary_emb
         # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape before rotary_emb: {k.shape}")
+        print(f"[Before] hidden_states shape: {hidden_states.shape}", flush=True)
+        print(f"[Before] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
+        print(f"[Before] positions: {positions}, device: {positions.device}",flush=True)
         q, k = self.rotary_emb(positions, q, k)
-        
+        print(f"[After] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
         # print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
         # print("Query storage:", q.storage().data_ptr())
@@ -385,11 +389,33 @@ class MixtralModel(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
+            print(f"[MIXTRAL Model]Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
         else:
             hidden_states = input_embeds
+            print(f"[MIXTRAL Model]Input embeds shape: {input_embeds.shape}, device: {input_embeds.device}")
         residual = None
+        
+        stream = torch.cuda.Stream()
+        event = torch.cuda.Event()
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            stride_begin_idx = range(8, 32, 8)
+            if i in [x-1 for x in stride_begin_idx]:
+                print(f"[MIXTRAL Model]Layer {i} begin kv migration")
+
+                size = self.token_to_kv_pool.size
+
+                # Launch exchange in a separate stream
+                with torch.cuda.stream(stream):
+                    inactive_swap_wrapper_token_index(
+                        self.token_to_kv_pool, self.linked_token_to_kv_pool, i, size, 8
+                    )
+                    event.record()  # Mark completion in this stream
+
+            # Wait for the migration to finish before continuing
+            if i in stride_begin_idx:
+                event.synchronize()
+
             hidden_states, residual, forward_batch = layer(
                 forward_batch.positions, hidden_states, forward_batch, residual
             )

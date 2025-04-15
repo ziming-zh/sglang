@@ -425,17 +425,17 @@ def fused_topk(
     # Find indices where topk_ids >= topk
     mask_4 = topk_ids >= prune_topk
     indices_to_change = mask_4.nonzero(as_tuple=True)
-
     if is_decode_mode:
-        num_to_change = int(mask_4.sum() * 19 / 20)  # Compute 19/20 of occurrences
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
+        num_tokens = topk_ids.shape[0]
+        num_to_force_miss = int(num_tokens * 0.2)  # 20% will be forced misses
 
-        if num_to_change > 0:
-            # Shuffle the indices randomly but deterministically
-            rand_perm = torch.randperm(len(indices_to_change[0]), generator=torch.Generator().manual_seed(42))
+        if num_to_force_miss > 0:
+            # Deterministically shuffle token indices
+            rand_indices = torch.randperm(num_tokens, generator=torch.Generator().manual_seed(42))[:num_to_force_miss]
 
-            # Select the first num_to_change elements
-            selected_indices = rand_perm[:num_to_change]
-            topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] = topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] % prune_topk
+            # For these tokens, force both expert IDs to be within `prune_topk` range (modding ensures pruning)
+            topk_ids[rand_indices,1] = prune_topk + 1
     else:
         topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
 

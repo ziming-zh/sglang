@@ -502,6 +502,12 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+        print(
+            f"cell_size={cell_size}, "
+            f"available_gpu_memory={available_gpu_memory}, "
+            f"total_gpu_memory={total_gpu_memory}, "
+            f"mem_fraction_static={self.mem_fraction_static}"
+        )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -592,6 +598,16 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
+            self.linked_token_to_kv_pool = MHATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=f'cuda:{self.gpu_id + self.tp_size}',
+            )
+            self.model.model.linked_token_to_kv_pool = self.linked_token_to_kv_pool
+            self.model.model.token_to_kv_pool = self.token_to_kv_pool
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

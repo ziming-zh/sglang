@@ -158,7 +158,7 @@ def swap_inactive_requests_token_indices(
     return new_request_to_tokens_1, new_request_to_tokens_2
 
 
-def simulate_request_to_tokens(size: int, avg_len: int = 200, num_requests: int = 100):
+def simulate_request_to_tokens(size: int, avg_len: int = 200, num_requests: int = 50):
     """
     Simulates request-to-token mapping using dynamic alloc. 
     Returns:
