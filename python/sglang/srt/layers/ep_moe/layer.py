@@ -322,7 +322,7 @@ class EPMoE(torch.nn.Module):
         available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
-        pruned_top_k = 2
+        pruned_top_k = 4
         # self.available_experts = available_experts or [True] * num_experts
         self.available_experts = available_experts or [True] * pruned_top_k + [False] * (num_experts - pruned_top_k) # temp: only 4 experts available
         self.num_available_experts = sum(self.available_experts)
