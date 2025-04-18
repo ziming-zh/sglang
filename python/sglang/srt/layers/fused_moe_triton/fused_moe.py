@@ -428,12 +428,12 @@ def fused_topk(
     if is_decode_mode:
         topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
         num_tokens = topk_ids.shape[0]
-        num_to_force_miss = int(num_tokens * 0.2)  # 20% will be forced misses
+        num_to_force_miss = int(num_tokens * 0.05)  # 20% will be forced misses
 
         if num_to_force_miss > 0:
-            # Deterministically shuffle token indices
-            rand_indices = torch.randperm(num_tokens, generator=torch.Generator().manual_seed(42))[:num_to_force_miss]
-
+            # Faster random selection
+            prob = torch.ones(num_tokens, device=topk_ids.device)
+            rand_indices = torch.multinomial(prob, num_to_force_miss, replacement=False)
             # For these tokens, force both expert IDs to be within `prune_topk` range (modding ensures pruning)
             topk_ids[rand_indices,1] = prune_topk + 1
     else:
