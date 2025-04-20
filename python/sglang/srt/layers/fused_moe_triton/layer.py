@@ -735,50 +735,10 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        # Create CUDA streams for asynchronous operations
-        stream = torch.cuda.Stream(device=hidden_states.device)
-
-        # Define the portion of rows to exchange (e.g., first 10% of rows)
-        num_rows = hidden_states.size(0)
-        rows_to_exchange = num_rows // 10  # Adjust the portion as needed
-
-        # Split `hidden_states` into parts to send and keep
-        hidden_to_send = hidden_states[:rows_to_exchange]
-        hidden_to_keep = hidden_states[rows_to_exchange:]
-
-        # Prepare a tensor to store received rows from the other GPU
-        received_hidden = torch.zeros_like(hidden_to_send, device=hidden_states.device)
-
-        # Use torch.distributed.all_to_all to exchange rows between GPUs
-        with torch.cuda.stream(stream):
-            # Perform the all-to-all communication
-            torch.distributed.all_to_all_single(
-                received_hidden,
-                hidden_to_send
-            )
-            
-        
-
-        # Synchronize the stream to ensure communication is complete
-        stream.synchronize()
-        
-        very_large_tensor_to_send = torch.randn(80000000//1000, device=hidden_states.device)
-        very_large_tensor_to_receive = torch.zeros_like(very_large_tensor_to_send)
-        with torch.cuda.stream(stream):
-            torch.distributed.all_to_all_single(
-                very_large_tensor_to_receive,
-                very_large_tensor_to_send
-            )
-        stream.synchronize()
-        
-
-        # Recombine the received rows with the remaining `hidden_states`
-        exchanged_hidden_states = torch.cat([received_hidden, hidden_to_keep], dim=0)
-
         # Perform the quantized matrix multiply on the exchanged hidden states
         final_hidden_states = self.quant_method.apply(
             layer=self,
-            x=exchanged_hidden_states,
+            x=hidden_states,
             router_logits=router_logits,
             top_k=self.top_k,
             renormalize=self.renormalize,
@@ -790,7 +750,16 @@ class FusedMoE(torch.nn.Module):
 
         # Perform a tensor parallel all-reduce if necessary
         if self.reduce_results and self.tp_size > 1:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            end_event.record()
+            
+            end_event.synchronize()
+            elapsed_time = start_event.elapsed_time(end_event)
+            print(f"[Allgather] {elapsed_time} ms")
 
         return final_hidden_states
 

@@ -293,9 +293,13 @@ class MixtralModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            import time
+            start = time.time()
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            end = time.time()
+            print(f"[Layer Forwarding Time] ({i}, {end-start})")
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
