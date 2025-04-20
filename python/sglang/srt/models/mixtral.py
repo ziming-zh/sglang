@@ -18,6 +18,7 @@
 
 from typing import Iterable, Optional, Tuple
 
+import logging
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -46,6 +47,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
+
+logger = logging.getLogger(__name__)
 
 class MixtralMoE(nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
@@ -92,7 +95,7 @@ class MixtralMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
-        self.swap_experts=True
+        self.swap_experts=False
        
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if(self.swap_experts==True):
@@ -111,7 +114,18 @@ class MixtralMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(hidden_states, router_logits)
         if self.tp_size > 1:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            
+            end_event.record()
+            end_event.synchronize()
+            elapsed_time = start_event.elapsed_time(end_event)
+            logger.info(
+                f"[AllReduce] Time taken: {elapsed_time:.2f} ms, "
+            )
         return final_hidden_states.view(orig_shape)
 
 
@@ -299,7 +313,11 @@ class MixtralModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
             end = time.time()
-            print(f"[Layer Forwarding Time] ({i}, {end-start})")
+            # log out the result
+            logger.info(
+                f"[Layer Forwarding Time] ({i}, {end-start})"
+            )
+            # print(f"[Layer Forwarding Time] ({i}, {end-start})")
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

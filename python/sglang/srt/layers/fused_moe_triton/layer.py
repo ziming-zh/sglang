@@ -322,8 +322,9 @@ class FusedMoE(torch.nn.Module):
         available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
+        self.prune_expert_num = 3
         # self.available_experts = available_experts or [True] * num_experts
-        self.available_experts = available_experts or [True] * 4 + [False] * (num_experts - 4) # temp: only 4 experts available
+        self.available_experts = available_experts or [True] * self.prune_expert_num + [False] * (num_experts - self.prune_expert_num) # temp: only 4 experts available
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -729,7 +730,7 @@ class FusedMoE(torch.nn.Module):
             topk_ids_adjusted.append(adjusted_ids)
 
         topk_ids = torch.tensor(topk_ids_adjusted, device=router_logits.device)
-        print(f"topk_ids: {topk_ids}")
+        # print(f"topk_ids: {topk_ids}")
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
@@ -759,7 +760,9 @@ class FusedMoE(torch.nn.Module):
             
             end_event.synchronize()
             elapsed_time = start_event.elapsed_time(end_event)
-            print(f"[Allgather] {elapsed_time} ms")
+            logger.info(
+                f"[AllReduce] Time taken: {elapsed_time:.2f} ms, "
+            )
 
         return final_hidden_states
 

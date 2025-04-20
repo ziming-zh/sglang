@@ -1151,7 +1151,7 @@ class RowParallelLinear(LinearBase):
             end_event.record()
             end_event.synchronize()
             elapsed_time = start_event.elapsed_time(end_event)
-            print(
+            logger.info(
                 f"[Dispatch]: {elapsed_time} ms"
             )
         else:
