@@ -322,7 +322,7 @@ class FusedMoE(torch.nn.Module):
         available_experts: Optional[List[bool]] = None,
     ):
         super().__init__()
-        self.prune_expert_num = 3
+        self.prune_expert_num = 8
         # self.available_experts = available_experts or [True] * num_experts
         self.available_experts = available_experts or [True] * self.prune_expert_num + [False] * (num_experts - self.prune_expert_num) # temp: only 4 experts available
         if params_dtype is None:
