@@ -421,7 +421,7 @@ def fused_topk(
         token_expert_indicies,
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
-    prune_topk = 2
+    prune_topk = 4
     # Find indices where topk_ids >= topk
     mask_4 = topk_ids >= prune_topk
     indices_to_change = mask_4.nonzero(as_tuple=True)
