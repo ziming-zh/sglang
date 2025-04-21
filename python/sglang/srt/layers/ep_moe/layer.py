@@ -623,7 +623,7 @@ class EPMoE(torch.nn.Module):
             # print("[FORWARD_CUDA] local input shape", x_local.shape, x_local.device)
             
             # retrieval
-            retrieval_start = time.time()
+            # retrieval_start = time.time()
             
             # Check for completed CPU computations and move back to GPU
             fetched_cpu_results = []
@@ -647,8 +647,8 @@ class EPMoE(torch.nn.Module):
                 print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, round: {self.round_id}, finished tasks: {finished_tasks}")
                 self.retrieve_results()
             
-            retrieval_end = time.time()
-            print(f"[Layer {self.layer_id}] Retrieved results from {retrieval_start} to {retrieval_end} in {retrieval_end-retrieval_start} seconds")
+            # retrieval_end = time.time()
+            # print(f"[Layer {self.layer_id}] Retrieved results from {retrieval_start} to {retrieval_end} in {retrieval_end-retrieval_start} seconds")
             # combination
             # combination_start = time.time()
                 
@@ -694,8 +694,8 @@ class EPMoE(torch.nn.Module):
             # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
             # combination_end = time.time()
             # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Combination time: {combination_end-combination_start} seconds")
-        forward_cuda_end = time.time()
-        print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")
+        # forward_cuda_end = time.time()
+        # print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")
         return x_local, residual_local, forward_batch_local
 
     def retrieve_results(self):
@@ -714,7 +714,7 @@ class EPMoE(torch.nn.Module):
         if self.parent_task_pipe.poll():
             task_result = self.parent_task_pipe.recv()
             
-            print(f"[Layer {self.layer_id}] Task {task_result.task_id} layer {task_result.layer_id} retrieved at {time.time()}")
+            # print(f"[Layer {self.layer_id}] Task {task_result.task_id} layer {task_result.layer_id} retrieved at {time.time()}")
         else:
             return
             
@@ -733,7 +733,7 @@ class EPMoE(torch.nn.Module):
             
         # cleanup shared memory
         cpu_result_shm.close()
-        print(f"[Layer {self.layer_id}] Task {task_result.task_id} retrieved and cleaned up at {time.time()}")
+        # print(f"[Layer {self.layer_id}] Task {task_result.task_id} retrieved and cleaned up at {time.time()}")
         
     def select_experts(
         self,

@@ -533,7 +533,7 @@ class ScheduleBatch:
     inactive_reqs_batch = None
     rid_list: List[str] = None
     
-    expected_batch_size: int = 60
+    expected_batch_size: int = 80
     cached_reqs: List[Req] = None
 
     @classmethod
@@ -1057,7 +1057,7 @@ class ScheduleBatch:
         # print(f"[REQS] {self.reqs}")
         self.out_cache_loc = self.alloc_token_slots(bs)
         self.rid_list = self.get_active_rids()
-        print(f"[RID_LIST] {self.rid_list}")
+        # print(f"[RID_LIST] {self.rid_list}")
         if self.model_config.is_encoder_decoder:
             locs = self.encoder_lens + self.seq_lens
             self.prepare_encoder_info_decode()

@@ -230,11 +230,11 @@ class MixtralAttention(nn.Module):
         # check the size of q, k before and after rotary_emb
         # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape before rotary_emb: {k.shape}")
-        print(f"[Before] hidden_states shape: {hidden_states.shape}", flush=True)
-        print(f"[Before] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
-        print(f"[Before] positions: {positions}, device: {positions.device}",flush=True)
+        # print(f"[Before] hidden_states shape: {hidden_states.shape}", flush=True)
+        # print(f"[Before] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
+        # print(f"[Before] positions: {positions}, device: {positions.device}",flush=True)
         q, k = self.rotary_emb(positions, q, k)
-        print(f"[After] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
+        # print(f"[After] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
         # print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
         # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
         # print("Query storage:", q.storage().data_ptr())
@@ -295,7 +295,7 @@ class MixtralDecoderLayer(nn.Module):
         # Self Attention
         # quit if hidden_states and residual are empty
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        forward_decode_start = time.time()
+        # forward_decode_start = time.time()
         if hidden_states.numel() == 0 and residual.numel() == 0:
             # print(f"[Mixtral layer {self.layer_id}]Both hidden states and residual are empty")
             assert False, "Both hidden states and residual are empty"
@@ -332,8 +332,8 @@ class MixtralDecoderLayer(nn.Module):
         # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
         # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        forward_decode_end = time.time()
-        print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
+        # forward_decode_end = time.time()
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
         return hidden_states, residual, forward_batch
 
 
