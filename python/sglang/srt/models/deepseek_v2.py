@@ -30,6 +30,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from python.sglang.srt.mem_cache.memory_pool import inactive_swap_wrapper_token_index, parallel_inactive_exchange_token_index
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
@@ -96,6 +97,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_id: int = 0,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -125,6 +127,7 @@ class DeepseekV2MoE(nn.Module):
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
+            layer_id=layer_id,
         )
 
         self.gate = ReplicatedLinear(
@@ -140,15 +143,15 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, parent_task_pipe=None, task_metadata=None, cpu_result_buffer=None):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        final_hidden_states, residual, forward_batch = (
+            self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=parent_task_pipe, task_metadata=task_metadata, cpu_result_buffer=cpu_result_buffer)
             * self.routed_scaling_factor
         )
         if shared_output is not None:
@@ -156,7 +159,7 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states.view(num_tokens, hidden_dim), residual, forward_batch
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -210,6 +213,7 @@ class DeepseekV2Attention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.layer_id = layer_id
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(
@@ -691,7 +695,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config, layer_id=layer_id)
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -711,6 +715,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if hidden_states.numel() == 0 and residual.numel() == 0:
+            # print(f"[Mixtral layer {self.layer_id}]Both hidden states
+            assert False, "Both hidden states and residual are empty. This should not happen."
+        
         # Self Attention
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -733,12 +741,26 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, start_idx, end_idx = all_gather(
                 hidden_states, forward_batch, self.tp_rank, self.tp_size, self.tp_group
             )
-            hidden_states = self.mlp(hidden_states)
+            # if mlp is not a MoE layer, we need to slice the hidden states
+            # to get the correct output
+            if not isinstance(self.mlp, DeepseekV2MoE):
+                hidden_states = self.mlp(hidden_states)
+            else:
+                hidden_states, residual, forward_batch = self.mlp(
+                    hidden_states,
+                    is_decode_mode=forward_batch.forward_mode.is_decode(),
+                    residual=residual,
+                    forward_batch=forward_batch,
+                    parent_task_pipe=self.parent_task_pipe, 
+                    task_metadata=self.task_metadata,
+                    cpu_result_buffer=self.cpu_result_buffer
+                )
+                    
             hidden_states = hidden_states[start_idx:end_idx]
         else:
             hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states, residual, forward_batch
 
 
 class DeepseekV2Model(nn.Module):
@@ -779,14 +801,34 @@ class DeepseekV2Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+    
+        stream = torch.cuda.Stream()
+        event = torch.cuda.Event()
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+            stride_begin_idx = range(8, self.layers, 8)
+            if i in [x-1 for x in stride_begin_idx]:
+                print(f"[DS-V2 Model]Layer {i} begin kv migration")
+
+                size = self.token_to_kv_pool.size
+
+                # Launch exchange in a separate stream
+                with torch.cuda.stream(stream):
+                    inactive_swap_wrapper_token_index(
+                        self.token_to_kv_pool, self.linked_token_to_kv_pool, i, size, 8
+                    )
+                    event.record()  # Mark completion in this stream
+
+            # Wait for the migration to finish before continuing
+            if i in stride_begin_idx:
+                event.synchronize()
+
+            hidden_states, residual, forward_batch = layer(
+                forward_batch.positions, hidden_states, forward_batch, residual
             )
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, forward_batch
 
 
 class DeepseekV2ForCausalLM(nn.Module):
@@ -820,11 +862,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states, forward_batch = self.model(input_ids, positions, forward_batch)
         if not forward_batch.forward_mode.is_idle():
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
+                forward_batch.input_ids, hidden_states, self.lm_head, forward_batch
+            ), forward_batch
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
