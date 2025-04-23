@@ -48,6 +48,43 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
+@triton.jit
+def split_rows_kernel(
+    input_ptr,       # pointer to [N, D] input
+    index_ptr,       # pointer to [K] indices
+    output_ptr,      # pointer to [K, D] output
+    N: tl.constexpr, # number of rows in input
+    D: tl.constexpr, # number of columns per row
+):
+    pid = tl.program_id(0)
+    row_idx = tl.load(index_ptr + pid)  # get the row index
+    row_start = row_idx * D
+    out_start = pid * D
+
+    offsets = tl.arange(0, D)
+    in_vals = tl.load(input_ptr + row_start + offsets)
+    tl.store(output_ptr + out_start + offsets, in_vals)
+
+def split_tensor_triton(tensor: torch.Tensor, local_idx: torch.Tensor, remote_idx: torch.Tensor):
+    if tensor.ndim == 1:
+        local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
+        remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
+        return local_tensor, remote_tensor
+    N, D = tensor.shape
+    device = tensor.device
+
+    def run_split(index_tensor):
+        K = index_tensor.shape[0]
+        if K == 0:
+            return tensor.new_empty((0, D))
+        output = torch.empty((K, D), dtype=tensor.dtype, device=device)
+        grid = lambda meta: (K,)
+        split_rows_kernel[grid](tensor, index_tensor, output, N, D)
+        return output
+
+    local_tensor = run_split(local_idx)
+    remote_tensor = run_split(remote_idx)
+    return local_tensor, remote_tensor
 
 class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
@@ -172,8 +209,7 @@ class ForwardBatch:
             if tensor is None:
                 return None, None
             return (
-                tensor.index_select(0, local_idx).clone() if local_idx.numel() > 0 else None,
-                tensor.index_select(0, remote_idx).clone() if remote_idx.numel() > 0 else None,
+                split_tensor_triton(tensor, local_idx, remote_idx)
             )
         def split_list(lst: Optional[List]):
             if lst is None:

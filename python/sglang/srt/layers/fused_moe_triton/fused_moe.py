@@ -429,7 +429,7 @@ def fused_topk(
     topk_ids[mask_overflow] %= prune_topk  # Fast in-place mod
 
     if is_decode_mode:
-        num_to_force_miss = int(num_tokens * 0.1)
+        num_to_force_miss = int(num_tokens * 0.05)
         if num_to_force_miss > 0:
             # Generate random token indices to force miss
             rand_indices = torch.randint(0, num_tokens, (num_to_force_miss,), device=topk_ids.device)

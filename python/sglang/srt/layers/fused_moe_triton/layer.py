@@ -6,8 +6,10 @@ from enum import Enum
 import random
 import time
 from typing import Callable, List, Optional, Tuple
-
 import torch
+import triton
+import triton.language as tl
+
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -44,6 +46,44 @@ TORCH_TO_NUMPY_DTYPE = {
     torch.bool: np.bool_,
     torch.bfloat16: np.float32  # Store bfloat16 as float32
 }
+
+@triton.jit
+def split_rows_kernel(
+    input_ptr,       # pointer to [N, D] input
+    index_ptr,       # pointer to [K] indices
+    output_ptr,      # pointer to [K, D] output
+    N: tl.constexpr, # number of rows in input
+    D: tl.constexpr, # number of columns per row
+):
+    pid = tl.program_id(0)
+    row_idx = tl.load(index_ptr + pid)  # get the row index
+    row_start = row_idx * D
+    out_start = pid * D
+
+    offsets = tl.arange(0, D)
+    in_vals = tl.load(input_ptr + row_start + offsets)
+    tl.store(output_ptr + out_start + offsets, in_vals)
+
+def split_tensor_triton(tensor: torch.Tensor, local_idx: torch.Tensor, remote_idx: torch.Tensor):
+    # if tensor.ndim == 1:
+    local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
+    remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
+    return local_tensor, remote_tensor
+    # N, D = tensor.shape
+    # device = tensor.device
+
+    # def run_split(index_tensor):
+    #     K = index_tensor.shape[0]
+    #     if K == 0:
+    #         return tensor.new_empty((0, D))
+    #     output = torch.empty((K, D), dtype=tensor.dtype, device=device)
+    #     grid = lambda meta: (K,)
+    #     split_rows_kernel[grid](tensor, index_tensor, output, N, D)
+    #     return output
+
+    # local_tensor = run_split(local_idx)
+    # remote_tensor = run_split(remote_idx)
+    # return local_tensor, remote_tensor
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
@@ -432,17 +472,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.task_metadata = task_metadata
         self.cpu_buffer = cpu_result_buffer
         if is_decode_mode:
-            if is_remote_toks.device != x.device:
-                is_remote_toks = is_remote_toks.to(x.device)
-            remote_idx = is_remote_toks.nonzero(as_tuple=True)[0]
-            local_idx = (~is_remote_toks).nonzero(as_tuple=True)[0]
-
-            x_remote = x.index_select(0, remote_idx)
-            x_local = x.index_select(0, local_idx)
-            topk_weights_remote = topk_weights.index_select(0, remote_idx)
-            topk_ids_remote = topk_ids.index_select(0, remote_idx)
-            topk_weights_local = topk_weights.index_select(0, local_idx)
-            topk_ids_local = topk_ids.index_select(0, local_idx)
+            remote_idx = torch.where(is_remote_toks)[0]
+            local_idx = torch.where(~is_remote_toks)[0]
+            # assert remote_idx and local_idx all on gpu
+            assert remote_idx.device == x.device
+            assert local_idx.device == x.device
+            topk_weights_local, topk_weights_remote = split_tensor_triton(
+                topk_weights, local_idx, remote_idx
+            )
+            split_weight_end = time.time()
+            print(f"[Layer {self.layer_id}] Split topk_weights in {split_weight_end-select_expert_end} seconds")
+            topk_ids_local, topk_ids_remote = split_tensor_triton(
+                topk_ids, local_idx, remote_idx
+            )
+            split_id_end = time.time()
+            print(f"[Layer {self.layer_id}] Split topk_ids in {split_id_end-split_weight_end} seconds")
+            x_local, x_remote = split_tensor_triton(
+                x, local_idx, remote_idx
+            )
+            split_x_end = time.time()
+            print(f"[Layer {self.layer_id}] Split x in {split_x_end-split_id_end} seconds")
+            
             
             real_split_start = time.time()
             forward_batch_local, forward_batch_remote = forward_batch.split(remote_idx, local_idx)
@@ -483,8 +533,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         
             
         if residual is not None:
-            residual_remote = residual[is_remote_toks]
-            residual_local = residual[~is_remote_toks]
+            if is_decode_mode:
+                if is_remote_toks.device != x.device:
+                    is_remote_toks = is_remote_toks.to(x.device)
+                remote_idx = is_remote_toks.nonzero(as_tuple=True)[0]
+                local_idx = (~is_remote_toks).nonzero(as_tuple=True)[0]
+                residual_local, residual_remote = split_tensor_triton(
+                    residual, local_idx, remote_idx
+                )
+            else:
+                residual_remote = None
+                residual_local = residual
         else:
             residual_remote = None
             residual_local = None
