@@ -42,7 +42,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -528,6 +528,13 @@ class ScheduleBatch:
 
     # device
     device: str = "cuda"
+    
+    # inactive request cache
+    inactive_reqs_batch = None
+    rid_list: List[str] = None
+    
+    expected_batch_size: int = 80
+    cached_reqs: List[Req] = None
 
     @classmethod
     def init_new(
@@ -964,6 +971,9 @@ class ScheduleBatch:
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        
+    def get_active_rids(self):
+        return [req.rid for req in self.reqs]
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -971,11 +981,83 @@ class ScheduleBatch:
         self.input_ids = self.output_ids
         self.output_ids = None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
+        if self.cached_reqs is None:
+            self.cached_reqs = []
+            self.cached_req_pool_indices = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_seq_lens = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_input_ids = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            self.cached_input_embeds = torch.empty(0, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            
 
         # Alloc mem
         bs = len(self.reqs)
+        if bs > self.expected_batch_size:
+            # put the extra things into the request cache
+            self.cached_reqs.extend(self.reqs[self.expected_batch_size :])
+            self.reqs = self.reqs[: self.expected_batch_size]
+            
+            self.cached_req_pool_indices = torch.cat(
+                [self.cached_req_pool_indices, self.req_pool_indices[self.expected_batch_size :]]
+            )
+            
+            self.cached_seq_lens = torch.cat(
+                [self.cached_seq_lens, self.seq_lens[self.expected_batch_size :]]
+            )
+            self.cached_input_ids = torch.cat(
+                [self.cached_input_ids, self.input_ids[self.expected_batch_size :]]
+            )
+            if self.input_embeds is not None:
+                self.cached_input_embeds = torch.cat(   
+                    [self.input_embeds, self.input_embeds[self.expected_batch_size :]]
+                )
+            self.req_pool_indices = self.req_pool_indices[: self.expected_batch_size]
+            self.seq_lens = self.seq_lens[: self.expected_batch_size]
+            self.input_ids = self.input_ids[: self.expected_batch_size]
+            if self.input_embeds is not None:
+                self.input_embeds = self.input_embeds[: self.expected_batch_size]
+            self.seq_lens_sum = self.seq_lens.sum().item()
+            bs = len(self.reqs)
+        elif bs < self.expected_batch_size:
+            if len(self.cached_reqs) > 0:
+                size_gap = self.expected_batch_size - bs
+                self.reqs.extend(self.cached_reqs[: size_gap])
+                self.cached_reqs = self.cached_reqs[size_gap :]
+                
+                self.req_pool_indices = torch.cat(
+                    [self.req_pool_indices, self.cached_req_pool_indices[: size_gap]]
+                )
+                self.cached_req_pool_indices = self.cached_req_pool_indices[size_gap :]
+                self.seq_lens = torch.cat(
+                    [self.seq_lens, self.cached_seq_lens[: size_gap]]
+                )
+                self.cached_seq_lens = self.cached_seq_lens[size_gap :]
+                self.input_ids = torch.cat(
+                    [self.input_ids, self.cached_input_ids[: size_gap]]
+                )
+                self.cached_input_ids = self.cached_input_ids[size_gap :]
+                if self.input_embeds is not None:
+                    self.input_embeds = torch.cat(
+                        [self.input_embeds, self.cached_input_embeds[: size_gap]]
+                    )
+                    self.cached_input_embeds = self.cached_input_embeds[size_gap :]
+                    
+                self.seq_lens_sum = self.seq_lens.sum().item()
+                
+                bs = len(self.reqs)
+        
+        print(f"Allocating {bs} tokens for decoding")
+        # print(f"[REQS] {self.reqs}")
         self.out_cache_loc = self.alloc_token_slots(bs)
-
+        self.rid_list = self.get_active_rids()
+        # print(f"[RID_LIST] {self.rid_list}")
         if self.model_config.is_encoder_decoder:
             locs = self.encoder_lens + self.seq_lens
             self.prepare_encoder_info_decode()
@@ -1000,6 +1082,7 @@ class ScheduleBatch:
         self,
         being_chunked_req: Optional[Req] = None,
         keep_indices: Optional[List[int]] = None,
+        keep_output_ids: bool = False,
     ):
         if keep_indices is None:
             keep_indices = [
@@ -1011,6 +1094,13 @@ class ScheduleBatch:
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            self.seq_lens = None
+            self.out_cache_loc = None
+            self.seq_lens_sum = 0
+            self.output_ids = None
+            self.req_pool_indices = None
+            self.return_logprob = False
+            
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -1029,7 +1119,8 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[new_indices]
+        if not keep_output_ids:
+            self.output_ids = self.output_ids[new_indices]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -1039,27 +1130,47 @@ class ScheduleBatch:
         self.has_stream = any(req.stream for req in self.reqs)
         self.has_grammar = any(req.grammar for req in self.reqs)
 
-        self.sampling_info.filter_batch(keep_indices, new_indices)
+        # self.sampling_info.filter_batch(keep_indices, new_indices)
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
+        if self.reqs is None or len(self.reqs) == 0:
+            if other is None or other.reqs is None or len(other.reqs) == 0:
+                return
+            self.reqs = other.reqs
+            self.req_pool_indices = other.req_pool_indices
+            self.seq_lens = other.seq_lens
+            self.out_cache_loc = None
+            self.seq_lens_sum = other.seq_lens_sum
+            self.output_ids = other.output_ids
+            self.return_logprob = other.return_logprob
+            self.top_logprobs_nums = other.top_logprobs_nums
+            self.has_stream = other.has_stream
+            self.has_grammar = other.has_grammar
+            # self.sampling_info = other.sampling_info
+            return
+        
+        # if hasattr(other, "sampling_info"):
+        #     self.sampling_info.merge_batch(other.sampling_info)
 
-        # Encoder-decoder infos
-        if self.model_config.is_encoder_decoder:
-            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
-            self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
+            # Encoder-decoder infos
+            if self.model_config.is_encoder_decoder:
+                self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+                self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
+                
+        if other is None or other.reqs is None or len(other.reqs) == 0:
+            return
+        
 
         self.req_pool_indices = torch.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens = torch.concat([self.seq_lens, other.seq_lens]) if self.seq_lens is not None else None
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            self.output_ids = torch.concat([self.output_ids, other.output_ids])
+        self.output_ids = torch.concat([self.output_ids, other.output_ids]) if self.output_ids is not None else None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
         elif self.return_logprob:
@@ -1071,6 +1182,92 @@ class ScheduleBatch:
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_stream = self.has_stream or other.has_stream
         self.has_grammar = self.has_grammar or other.has_grammar
+            
+    def split_batch(
+        self,
+        being_chunked_req: Optional[Req] = None,
+        keep_indices: Optional[List[int]] = None,
+    ):
+        if keep_indices is None:
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished() and self.reqs[i] is not being_chunked_req
+            ]
+
+        if keep_indices is None or len(keep_indices) == 0:
+            # Move all requests to the opposite batch, self becomes empty
+            opposite_batch = ScheduleBatch(
+                reqs=self.reqs,
+                seq_lens=self.seq_lens,
+                out_cache_loc=self.out_cache_loc,
+                seq_lens_sum=self.seq_lens_sum,
+                req_pool_indices=self.req_pool_indices,
+                return_logprob=self.return_logprob,
+                has_stream=self.has_stream,
+                has_grammar=self.has_grammar,
+                # sampling_info=self.sampling_info.clone(),
+                output_ids=None,  # No filtering of output_ids in the opposite batch
+            )
+
+            # Clear self
+            self.reqs = []
+            self.seq_lens = None
+            self.out_cache_loc = None
+            self.seq_lens_sum = 0
+            self.req_pool_indices = None
+            self.return_logprob = False
+            self.has_stream = False
+            self.has_grammar = False
+            # self.sampling_info.clear()
+            
+            return opposite_batch
+
+        if len(keep_indices) == len(self.reqs):
+            # No need to split, opposite batch is empty
+            return None
+
+        # Compute indices for removed requests
+        remove_indices = [i for i in range(len(self.reqs)) if i not in keep_indices]
+
+        # Extract new batch properties
+        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+        removed_indices = torch.tensor(remove_indices, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        # Create opposite batch with removed requests
+        opposite_batch = ScheduleBatch(
+            reqs=[self.reqs[i] for i in remove_indices],
+            seq_lens=self.seq_lens[removed_indices],
+            out_cache_loc=None,
+            seq_lens_sum=self.seq_lens[removed_indices].sum().item(),
+            req_pool_indices=self.req_pool_indices[removed_indices],
+            return_logprob=any(self.reqs[i].return_logprob for i in remove_indices),
+            has_stream=any(self.reqs[i].stream for i in remove_indices),
+            has_grammar=any(self.reqs[i].grammar for i in remove_indices),
+            # sampling_info=self.sampling_info.filter_batch(remove_indices, removed_indices),
+            output_ids=None,  # Opposite batch does not retain output_ids
+        )
+
+        # Modify self in place (filtered batch)
+        self.reqs = [self.reqs[i] for i in keep_indices]
+        self.seq_lens = self.seq_lens[new_indices]
+        self.req_pool_indices = self.req_pool_indices[new_indices]
+        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.out_cache_loc = None
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        if self.return_logprob:
+            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
+        else:
+            self.top_logprobs_nums = None
+        self.has_stream = any(req.stream for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
+        # self.sampling_info.filter_batch(keep_indices, new_indices)
+
+        return opposite_batch
 
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
@@ -1114,7 +1311,76 @@ class ScheduleBatch:
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            rid_list = self.rid_list
         )
+
+    def update_from_model_worker_batch(self, model_worker_batch):
+        """Update ScheduleBatch attributes from a ModelWorkerBatch."""
+        # self.forward_mode = model_worker_batch.forward_mode
+        # self.input_ids = model_worker_batch.input_ids
+        # self.req_pool_indices = model_worker_batch.req_pool_indices
+        # self.seq_lens = model_worker_batch.seq_lens
+        # self.out_cache_loc = model_worker_batch.out_cache_loc
+        # self.seq_lens_sum = model_worker_batch.seq_lens_sum
+        # self.return_logprob = model_worker_batch.return_logprob
+        # self.top_logprobs_nums = model_worker_batch.top_logprobs_nums
+        # self.global_num_tokens = model_worker_batch.global_num_tokens
+        # self.can_run_dp_cuda_graph = model_worker_batch.can_run_dp_cuda_graph
+        # self.extend_num_tokens = model_worker_batch.extend_num_tokens
+        
+        if self.forward_mode.is_decode():
+            # print("[BEFORE] self.reqs: ", self.reqs)
+            print("[BEFORE] self.seq_lens: ", self.seq_lens)
+            # print("[BEFORE] self.output_ids: ", self.output_ids)
+            # if self.inactive_reqs_batch is not None:
+            #     print("[BEFORE] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
+            # self.rid_list = model_worker_batch.rid_list
+            # Put the req into inactive_req list if its rid is not within the model_worker_batch.rid_list
+            inactive_reqs_idx = [i for i, req in enumerate(self.reqs) if req.rid in model_worker_batch.rid_list]
+            cached_inactive_req_batch = self.split_batch(keep_indices=inactive_reqs_idx)
+            
+            # if no inactive reqs, directly update the batch and return
+            if self.inactive_reqs_batch is None:
+                self.inactive_reqs_batch = cached_inactive_req_batch
+                return
+            
+            if self.inactive_reqs_batch.reqs is not None:
+                to_active_reqs_idx = [i for i, req in enumerate(self.inactive_reqs_batch.reqs) if req.rid not in model_worker_batch.rid_list]
+                cached_active_req_batch = self.inactive_reqs_batch.split_batch(keep_indices=to_active_reqs_idx)
+                self.merge_batch(cached_active_req_batch)
+            self.inactive_reqs_batch.merge_batch(cached_inactive_req_batch)
+            # print("[AFTER] self.reqs: ", self.reqs)
+            print("[AFTER] self.seq_lens: ", self.seq_lens)
+            # print("[AFTER] self.output_ids: ", self.output_ids)
+            # if self.inactive_reqs_batch is not None:
+                # print("[AFTER] self.inactive_reqs_batch.reqs: ", self.inactive_reqs_batch.reqs)
+
+        # if model_worker_batch.extend_seq_lens is not None:
+        #     self.extend_lens = model_worker_batch.extend_seq_lens
+        # if model_worker_batch.extend_prefix_lens is not None:
+        #     self.prefix_lens = model_worker_batch.extend_prefix_lens
+        # if model_worker_batch.extend_logprob_start_lens is not None:
+        #     self.extend_logprob_start_lens = model_worker_batch.extend_logprob_start_lens
+
+        # self.encoder_cached = model_worker_batch.encoder_cached
+        # self.encoder_lens = model_worker_batch.encoder_lens
+        # self.encoder_lens_cpu = model_worker_batch.encoder_lens_cpu
+        # self.encoder_out_cache_loc = model_worker_batch.encoder_out_cache_loc
+        # self.input_embeds = model_worker_batch.input_embeds
+
+        # # Updating request-related information
+        # for req, image_input in zip(self.reqs, model_worker_batch.image_inputs):
+        #     req.image_inputs = image_input
+
+        # for req, lora_path in zip(self.reqs, model_worker_batch.lora_paths):
+        #     req.lora_path = lora_path
+
+        # if model_worker_batch.sampling_info:
+        #     self.sampling_info = model_worker_batch.sampling_info
+
+        # # Updating request-to-token pool records
+        # self.req_to_token_pool.update_from_write_records(model_worker_batch.req_to_token_pool_records)
+
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
@@ -1186,6 +1452,68 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+    
+    # The rid list
+    rid_list: Optional[List[str]] = None
+        
+    def update_from_forward_batch(self, forward_batch: ForwardBatch):
+        changes = []
+
+        def update_attr(attr_name, new_value):
+            old_value = getattr(self, attr_name, None)
+            if isinstance(old_value, torch.Tensor) and isinstance(new_value, torch.Tensor):
+                if not torch.equal(old_value, new_value):
+                    setattr(self, attr_name, new_value)
+                    changes.append(attr_name)
+            elif old_value != new_value:
+                setattr(self, attr_name, new_value)
+                changes.append(attr_name)
+        
+        # print(f"[Before] seq_lens: {self.seq_lens}")
+        # print(f"[Before] input_ids: {self.input_ids}")
+        # print(f"[Before] req_pool_indices: {self.req_pool_indices}")
+        # print(f"[Before] out_cache_loc: {self.out_cache_loc}")
+        # print(f"[Before] rid_list: {self.rid_list}")
+                
+        update_attr("forward_mode", forward_batch.forward_mode)
+        update_attr("input_ids", forward_batch.input_ids)
+        update_attr("req_pool_indices", forward_batch.req_pool_indices)
+        update_attr("seq_lens", forward_batch.seq_lens)
+        update_attr("out_cache_loc", forward_batch.out_cache_loc)
+        update_attr("image_inputs", forward_batch.image_inputs)
+        update_attr("encoder_cached", forward_batch.encoder_cached)
+        update_attr("encoder_lens", forward_batch.encoder_lens)
+        update_attr("encoder_lens_cpu", forward_batch.encoder_lens_cpu)
+        update_attr("encoder_out_cache_loc", forward_batch.encoder_out_cache_loc)
+        update_attr("seq_lens_sum", forward_batch.seq_lens_sum)
+        update_attr("return_logprob", forward_batch.return_logprob)
+        update_attr("top_logprobs_nums", forward_batch.top_logprobs_nums)
+        update_attr("global_num_tokens", forward_batch.global_num_tokens)
+        update_attr("can_run_dp_cuda_graph", forward_batch.can_run_dp_cuda_graph)
+        update_attr("lora_paths", forward_batch.lora_paths)
+        update_attr("sampling_info", forward_batch.sampling_info)
+        update_attr("input_embeds", forward_batch.input_embeds)
+        update_attr("rid_list", forward_batch.rid_list)
+
+        # print(f"[After] seq_lens: {self.seq_lens}")
+        # print(f"[After] input_ids: {self.input_ids}")
+        # print(f"[After] req_pool_indices: {self.req_pool_indices}")
+        # print(f"[After] out_cache_loc: {self.out_cache_loc}")
+        # print(f"[After] rid_list: {self.rid_list}")
+        # if not forward_batch.forward_mode.is_decode():
+        #     update_attr("extend_seq_lens", forward_batch.extend_seq_lens_cpu)
+        #     update_attr("extend_prefix_lens", forward_batch.extend_prefix_lens_cpu)
+        #     update_attr("extend_logprob_start_lens", forward_batch.extend_logprob_start_lens_cpu)
+
+        # # Handle LoRA updates if applicable
+        # if forward_batch.model_runner.server_args.lora_paths is not None:
+        #     forward_batch.model_runner.lora_manager.update_lora_batch(self)
+
+        # if changes:
+        #     print(f"Updated attributes: {', '.join(changes)}")
+
+        # Return an updated dataclass instance (preserving immutability if needed)
+        return self
 
 
 @triton.jit

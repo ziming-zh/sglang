@@ -17,7 +17,7 @@
 """Inference-only Mixtral model."""
 
 from typing import Iterable, Optional, Tuple
-
+import time
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -27,6 +27,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
+from python.sglang.srt.mem_cache.memory_pool import inactive_swap_wrapper_token_index, parallel_inactive_exchange_token_index
 from sglang.srt.layers.ep_moe.layer import EPMoE
 from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
@@ -66,6 +67,7 @@ class MixtralMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
         prefix: str = "",
+        layer_id: int = 0,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -91,18 +93,19 @@ class MixtralMoE(nn.Module):
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
+            layer_id=layer_id,
         )
         self.swap_experts=True
        
-    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch):
+    def forward(self, hidden_states: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, parent_task_pipe=None, task_metadata=None, cpu_result_buffer=None):
         if(self.swap_experts==True):
-            print("[Testing]Swapping experts")
+            # print("[Testing]Swapping experts")
             import time
             start = time.time()
             self.experts.quant_method.update_experts(self.experts, 1, "remove", available_experts=self.experts.available_experts)
             self.experts.quant_method.update_experts(self.experts, 1, "load", torch.randn(2 * self.experts.intermediate_size_per_partition, self.hidden_size), torch.randn(self.hidden_size, self.experts.intermediate_size_per_partition), available_experts=self.experts.available_experts)
             end = time.time()
-            print(f"[Testing]Swapping experts took {end-start} seconds")
+            # print(f"[Testing]Swapping experts took {end-start} seconds")
             self.swap_experts=False
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -117,18 +120,24 @@ class MixtralMoE(nn.Module):
         
         available_experts = self.experts.available_experts
         
-        print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL MoE]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
-        print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
+        final_hidden_states, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=parent_task_pipe, task_metadata=task_metadata, cpu_result_buffer=cpu_result_buffer)
+        # print(f"[MIXTRAL MoE]Forward batch out_cache_loc after expert forwarding: {forward_batch.out_cache_loc}")
         
-        print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
+        # print(f"[MIXTRAL before all-reduce]Final hidden states shape: {final_hidden_states.shape}")
         
         if self.tp_size > 1:
-            final_hidden_states[forward_batch.is_local_toks] = tensor_model_parallel_all_reduce(final_hidden_states[forward_batch.is_local_toks]) # This all-reduce is causing problem, and we only need to do the all-to-all for 
-        torch.cuda.synchronize()
-        print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}")
-        print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+            if is_decode_mode:
+                # print(f"[Testing]Final hidden states shape: {final_hidden_states.shape}")
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states) # This all-reduce is causing problem, and we only need to do the all-to-all for 
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                
+        # print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # torch.cuda.synchronize()
+        # print(f"[MIXTRAL after all-reduce]Final hidden states shape: {final_hidden_states.shape}, device: {final_hidden_states.device}")
+        # print(f"[MIXTRAL after all-reduce]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         ### TODO: Add collect logic here
         ### Collect the tokens from other MoE instance (that will sent back from the collect_buffer)
         ### assert that there should be nothing to collect during the prefilling phase
@@ -170,6 +179,7 @@ class MixtralAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.layer_id = layer_id
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -208,28 +218,31 @@ class MixtralAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        print(f"[MIXTRAL Attention]Forward batch: {forward_batch}")
+        # print(f"[MIXTRAL Attention]Forward batch: {forward_batch}")
         qkv, _ = self.qkv_proj(hidden_states)
-        print(f"[MIXTRAL qkv_proj]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL qkv_proj]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        print("Query storage:", q.storage().data_ptr())
-        print("Key storage:", k.storage().data_ptr())
-        print("Position storage:", positions.storage().data_ptr())
-        print("Forward batch storage:", forward_batch.out_cache_loc.storage().data_ptr())
-        positions = positions.clone()
-        print("Position storage after clone:", positions.storage().data_ptr())
+        # try:
+        #     print(f"[MIXTRAL qkv split]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # except Exception as e:
+        #     print(f"[MIXTRAL qkv split] Layer id: {self.layer_id}, Error: {e}")
+        # print("Position storage after clone:", positions.storage().data_ptr())
         # check the size of q, k before and after rotary_emb
-        print(f"[MIXTRAL Attention]q shape: {q.shape}")
-        print(f"[MIXTRAL Attention]k shape: {k.shape}")
-        
+        # print(f"[MIXTRAL Attention]q shape before rotary_emb: {q.shape}")
+        # print(f"[MIXTRAL Attention]k shape before rotary_emb: {k.shape}")
+        # print(f"[Before] hidden_states shape: {hidden_states.shape}", flush=True)
+        # print(f"[Before] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
+        # print(f"[Before] positions: {positions}, device: {positions.device}",flush=True)
         q, k = self.rotary_emb(positions, q, k)
-        
-        print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
-        print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
-        print("Query storage:", q.storage().data_ptr())
-        print("Key storage:", k.storage().data_ptr())
-        print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[After] out_cache_loc: {forward_batch.out_cache_loc}",flush=True)
+        # print(f"[MIXTRAL Attention]q shape after rotary_emb: {q.shape}")
+        # print(f"[MIXTRAL Attention]k shape after rotary_emb: {k.shape}")
+        # print("Query storage:", q.storage().data_ptr())
+        # print("Key storage:", k.storage().data_ptr())
+        # try:
+        #     print(f"[MIXTRAL Attention]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # except Exception as e:
+        #     print(f"[MIXTRAL Attention] Layer id: {self.layer_id}, Error: {e}")
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -265,6 +278,7 @@ class MixtralDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
+            layer_id=layer_id,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -280,19 +294,20 @@ class MixtralDecoderLayer(nn.Module):
     ):
         # Self Attention
         # quit if hidden_states and residual are empty
-        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # forward_decode_start = time.time()
         if hidden_states.numel() == 0 and residual.numel() == 0:
-            print(f"[Mixtral layer {self.layer_id}]Both hidden states and residual are empty")
-            return hidden_states, residual, forward_batch
+            # print(f"[Mixtral layer {self.layer_id}]Both hidden states and residual are empty")
+            assert False, "Both hidden states and residual are empty"
         
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            print(f"[Testing]Residual shape: {residual.shape}")
-            print(f"[Testing]Hidden states shape: {hidden_states.shape}")
+            # print(f"[Testing]Residual shape: {residual.shape}")
+            # print(f"[Testing]Hidden states shape: {hidden_states.shape}")
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before self_attn: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before self_attn: {forward_batch.out_cache_loc}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -303,20 +318,22 @@ class MixtralDecoderLayer(nn.Module):
         # hidden_states = self.speculation_logit(hidden_states)
         
         is_decode_mode = forward_batch.forward_mode.is_decode()
-        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before post attention: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc before post attention: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before post-attention: {hidden_states.shape}, device: {hidden_states.device}")
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
-        print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
-        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape before moe: {hidden_states.shape}, device: {hidden_states.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Residual shape before moe: {residual.shape}, device: {residual.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
         
-        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch)
-        print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
-        print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
-        print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
-        
+        hidden_states, residual, forward_batch = self.block_sparse_moe(hidden_states, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=self.parent_task_pipe, task_metadata=self.task_metadata, cpu_result_buffer=self.cpu_result_buffer)
+        # print(f"[MIXTRAL layer {self.layer_id}]Hidden states shape after moe: {hidden_states.shape}, device: {hidden_states.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Residual shape after moe: {residual.shape}, device: {residual.device}")
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward batch out_cache_loc: {forward_batch.out_cache_loc}")
+        # forward_decode_end = time.time()
+        # print(f"[MIXTRAL layer {self.layer_id}]Forward decode from {forward_decode_start} to {forward_decode_end} took {forward_decode_end-forward_decode_start} seconds")
         return hidden_states, residual, forward_batch
 
 
@@ -344,6 +361,24 @@ class MixtralModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # # Create a queue for offloading tasks and a queue for results
+        # import multiprocessing as mp
+        # from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
+        # self.task_queue = mp.Queue(maxsize=1000)
+        # self.result_queue = [mp.Queue(maxsize=1000) for _ in range(config.num_hidden_layers)]
+        
+        # self.w13_cpu = torch.randn(config.num_local_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
+        # self.w2_cpu = torch.randn(config.num_local_experts, config.hidden_size, config.intermediate_size, device='cpu')
+        
+        # self.worker_process = mp.Process(target=cpu_offload_worker, args=(self.task_queue, self.result_queue, self.complete_token_manager, self.w13_cpu, self.w2_cpu))
+        # self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
+        # self.worker_process.start()
+        
+        # register task_queue and result_queue to each layer
+        # for layer_id, layer in enumerate(self.layers):
+        #     layer.task_queue = self.task_queue
+        #     layer.result_queue = self.result_queue[layer_id]
 
     def forward(
         self,
@@ -354,19 +389,41 @@ class MixtralModel(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
+            print(f"[MIXTRAL Model]Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
         else:
             hidden_states = input_embeds
+            print(f"[MIXTRAL Model]Input embeds shape: {input_embeds.shape}, device: {input_embeds.device}")
         residual = None
+        
+        stream = torch.cuda.Stream()
+        event = torch.cuda.Event()
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            stride_begin_idx = range(8, 32, 8)
+            if i in [x-1 for x in stride_begin_idx]:
+                print(f"[MIXTRAL Model]Layer {i} begin kv migration")
+
+                size = self.token_to_kv_pool.size
+
+                # Launch exchange in a separate stream
+                with torch.cuda.stream(stream):
+                    inactive_swap_wrapper_token_index(
+                        self.token_to_kv_pool, self.linked_token_to_kv_pool, i, size, 8
+                    )
+                    event.record()  # Mark completion in this stream
+
+            # Wait for the migration to finish before continuing
+            if i in stride_begin_idx:
+                event.synchronize()
+
             hidden_states, residual, forward_batch = layer(
-                positions, hidden_states, forward_batch, residual
+                forward_batch.positions, hidden_states, forward_batch, residual
             )
         if hidden_states.numel() > 0:
             hidden_states, _ = self.norm(hidden_states, residual)
             
-        print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
-        return hidden_states
+        # print(f"[Forward Finished]Hidden states shape: {hidden_states.shape}")
+        return hidden_states, forward_batch
 
 
 class MixtralForCausalLM(nn.Module):
@@ -390,10 +447,12 @@ class MixtralForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        # print(f"[MixtralForCausalLM]Forward batch input_ids: {input_ids}")
+        assert input_ids.storage() is not None, "Input has no storage."
+        hidden_states, forward_batch = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+            forward_batch.input_ids, hidden_states, self.lm_head, forward_batch
+        ), forward_batch
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

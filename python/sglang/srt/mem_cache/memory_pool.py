@@ -22,6 +22,8 @@ BaseTokenToKVPool maps a token location to its KV cache data.
 """
 
 import logging
+import random
+import threading
 from typing import List, Tuple, Union
 
 import torch
@@ -256,13 +258,18 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        print("set_kv_buffer")
-        print(f"loc: {loc}")
-        print(f"cache_k's shape: {cache_k.shape}")
-        print(f"cache_v's shape: {cache_v.shape}")
-        print(f"[Before] k_buffer's shape: {self.k_buffer[layer.layer_id].shape}")
-        print(f"[Before] v_buffer's shape: {self.v_buffer[layer.layer_id].shape}")
+        # print("set_kv_buffer")
+        # print(f"loc: {loc}")
+        # print(f"cache_k's shape: {cache_k.shape}")
+        # print(f"cache_v's shape: {cache_v.shape}")
+        # print(f"[Before] k_buffer's shape: {self.k_buffer[layer.layer_id].shape}")
+        # print(f"[Before] v_buffer's shape: {self.v_buffer[layer.layer_id].shape}")
         layer_id = layer.layer_id
+        
+        # Ensure loc is within bounds
+        max_loc = self.k_buffer[layer_id].shape[0]
+        assert torch.all((loc >= 0) & (loc < max_loc)), f"Error: [Layer {layer.layer_id}] loc index {loc} is out of bounds (valid range: 0 to {max_loc - 1})."
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -360,6 +367,10 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        
+        # Ensure loc is within bounds
+        max_loc = self.kv_buffer[layer_id].shape[0]
+        assert torch.all((loc >= 0) & (loc < max_loc)), f"Error: loc index {loc} is out of bounds (valid range: 0 to {max_loc - 1})."
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -425,3 +436,124 @@ class DoubleSparseTokenToKVPool(BaseTokenToKVPool):
         self.k_buffer[layer_id][loc] = cache_k
         self.v_buffer[layer_id][loc] = cache_v
         self.label_buffer[layer_id][loc] = cache_label
+
+def swap_inactive_requests_token_indices(
+    pool1: "MHATokenToKVPool",
+    pool2: "MHATokenToKVPool",
+    layer_id: int,
+    stride_num: int,
+    request_to_tokens_1: List[List[int]],
+    is_active_1: List[bool],
+    request_to_tokens_2: List[List[int]],
+    is_active_2: List[bool],
+) -> Tuple[List[List[int]], List[List[int]]]:
+    """
+    Swaps inactive requests between two KV pools and returns new request_to_tokens_* mappings.
+    """
+
+    def collect_inactive(request_to_tokens, is_active):
+        return [(i, token_ids) for i, (token_ids, active) in enumerate(zip(request_to_tokens, is_active)) if not active]
+
+    # Get inactive requests and their token indices
+    spans_1 = collect_inactive(request_to_tokens_1, is_active_1)
+    spans_2 = collect_inactive(request_to_tokens_2, is_active_2)
+
+    # Flatten all token indices to be swapped
+    flat_tokens_1 = torch.tensor([idx for _, toks in spans_1 for idx in toks], dtype=torch.int32)
+    flat_tokens_2 = torch.tensor([idx for _, toks in spans_2 for idx in toks], dtype=torch.int32)
+
+    # Allocate new locations
+    new_locs_1 = pool1.alloc(len(flat_tokens_2))
+    new_locs_2 = pool2.alloc(len(flat_tokens_1))
+
+    if new_locs_1 is None or new_locs_2 is None:
+        raise RuntimeError("Not enough memory to perform token swap.")
+
+    # Free old locations
+    if len(flat_tokens_1) > 0:
+        pool1.free(flat_tokens_1)
+    if len(flat_tokens_2) > 0:
+        pool2.free(flat_tokens_2)
+
+    # Check if pool1 and pool2 are MLATokenToKVPool
+    if hasattr(pool1, "kv_buffer"):
+        buffer1 = pool1.kv_buffer
+    else:
+        buffer1 = zip(pool1.k_buffer[layer_id:layer_id + stride_num], pool1.v_buffer[layer_id:layer_id + stride_num])
+    
+    if hasattr(pool2, "kv_buffer"):
+        buffer2 = pool2.kv_buffer
+    else:
+        buffer2 = zip(pool2.k_buffer[layer_id:layer_id + stride_num], pool2.v_buffer[layer_id:layer_id + stride_num])
+    
+    if hasattr(pool1, "kv_buffer") and hasattr(pool2, "kv_buffer"):
+        for kv1, kv2 in zip(buffer1, buffer2):
+            kv1[new_locs_1] = kv2[flat_tokens_2.to(kv2.device)].to(kv1.device)
+            kv2[new_locs_2] = kv1[flat_tokens_1.to(kv1.device)].to(kv2.device)
+    else:
+        # Copy actual KV data (from kv_buffer when MLATokenToKVPool, otherwise from k_buffer and v_buffer)
+        for (k1, v1), (k2, v2) in zip(buffer1, buffer2):
+            k1[new_locs_1] = k2[flat_tokens_2.to(k2.device)].to(k1.device)
+            v1[new_locs_1] = v2[flat_tokens_2.to(v2.device)].to(v1.device)
+            k2[new_locs_2] = k1[flat_tokens_1.to(k1.device)].to(k2.device)
+            v2[new_locs_2] = v1[flat_tokens_1.to(v1.device)].to(v2.device)
+
+    # Rebuild request-to-token-index mapping
+    def rebuild_mapping(old_mapping, spans, flat_locs):
+        new_mapping = old_mapping.copy()
+        offset = 0
+        for req_id, toks in spans:
+            length = len(toks)
+            new_mapping[req_id] = flat_locs[offset:offset + length].tolist()
+            offset += length
+        return new_mapping
+
+    new_request_to_tokens_1 = rebuild_mapping(request_to_tokens_1, spans_1, new_locs_1)
+    new_request_to_tokens_2 = rebuild_mapping(request_to_tokens_2, spans_2, new_locs_2)
+
+    return new_request_to_tokens_1, new_request_to_tokens_2
+
+
+def simulate_request_to_tokens(size: int, avg_len: int = 200, num_requests: int = 50):
+    """
+    Simulates request-to-token mapping using dynamic alloc. 
+    Returns:
+        request_to_tokens: List[List[int]]
+        is_active: List[bool]
+    """
+    request_to_tokens = []
+    is_active = []
+    curr = 1  # Start from 1 to avoid reserved padded slot
+    for _ in range(num_requests):
+        if curr >= size:
+            break
+        length = avg_len + random.randint(-10, 10)
+        tokens = list(range(curr, min(curr + length, size)))
+        request_to_tokens.append(tokens)
+        is_active.append(random.random() < 0.5)
+        curr += length
+    return request_to_tokens, is_active
+
+def inactive_swap_wrapper_token_index(pool1, pool2, layer_id, size, stride_num):
+    request_to_tokens_1, is_active_1 = simulate_request_to_tokens(size)
+    request_to_tokens_2, is_active_2 = simulate_request_to_tokens(size)
+
+    swap_inactive_requests_token_indices(
+        pool1, pool2, layer_id, stride_num,
+        request_to_tokens_1, is_active_1,
+        request_to_tokens_2, is_active_2
+    )
+
+
+def parallel_inactive_exchange_token_index(source_pools, target_pools, layer_id, size, stride_num):
+    threads = []
+    for i in range(len(source_pools)):
+        t = threading.Thread(
+            target=inactive_swap_wrapper_token_index,
+            args=(source_pools[i], target_pools[i], layer_id, size, stride_num)
+        )
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+        

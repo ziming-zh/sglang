@@ -57,6 +57,9 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
+import multiprocessing as mp
+from multiprocessing import shared_memory, Manager, Lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1263,3 +1266,49 @@ def should_use_tensor_core(
         return gqa_group_size > 4
     else:
         return False
+
+class CompleteTokenQueryService:
+    def __init__(self, tp_rank_range, num_layers=32, cache_window=5):
+        self.tp_rank_range = tp_rank_range
+        self.num_layers = num_layers
+        self.cache_window = cache_window
+
+        # Locks per layer
+        self.locks = [mp.Lock() for _ in range(num_layers)]
+
+        # Shared memory for token computation counts
+        self.compute_cnt = [mp.Array('i', 1000, lock=False) for _ in range(num_layers)]  # Supports up to 100 tokens/layer
+
+        # Shared cache
+        self.cache_key = mp.Array('i', num_layers, lock=False)
+        self.cache_value = [[mp.Array('i', 1000, lock=False) for _ in range(cache_window)] for _ in range(num_layers)]  # Up to 100 cached tokens/layer
+
+    def update_token(self, token, layer_id):
+        """Atomically update the computation count for a specific token in the given layer."""
+        with self.locks[layer_id]:
+            self.compute_cnt[layer_id][token] += 1
+
+    def query(self, round_id, layer_id):
+        """Query completed tokens for a specific layer_id key."""
+
+        with self.locks[layer_id]:
+            if round_id <= self.cache_key[layer_id] and round_id > self.cache_key[layer_id] - self.cache_window:
+                return [token for token in self.cache_value[layer_id][round_id % self.cache_window] if token != 0]
+
+            finished_tokens = []
+            for token in range(1000):  # Check all tokens
+                if self.compute_cnt[layer_id][token] > self.tp_rank_range:
+                    assert False, f"Token {token} has been computed more than {self.tp_rank_range} times"
+                if self.compute_cnt[layer_id][token] == self.tp_rank_range:
+                    finished_tokens.append(token)
+                    print(f"task {token} is complete for layer {layer_id}")
+                    self.compute_cnt[layer_id][token] = 0  # Reset count
+
+            self.cache_key[layer_id] = round_id
+            # reset cache
+            for i in range(1000):
+                self.cache_value[layer_id][round_id % self.cache_window][i] = 0
+            for i, token in enumerate(finished_tokens):
+                self.cache_value[layer_id][round_id % self.cache_window][i] = token
+
+            return finished_tokens

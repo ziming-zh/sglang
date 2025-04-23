@@ -74,6 +74,7 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerSta
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    CompleteTokenQueryService,
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
@@ -101,6 +102,7 @@ class Scheduler:
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -113,6 +115,7 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.complete_token_manager = complete_token_manager
 
         # Session info
         self.sessions = {}
@@ -197,6 +200,7 @@ class Scheduler:
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            complete_token_manager=complete_token_manager,
         )
 
         # Get token and memory info from the model worker
@@ -386,7 +390,7 @@ class Scheduler:
             self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)
+                result, batch = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # Self-check and re-init some states when the server is idle
@@ -407,7 +411,7 @@ class Scheduler:
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
-                result = self.run_batch(batch)
+                result, batch = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
@@ -788,7 +792,9 @@ class Scheduler:
             return new_batch
 
         # Run decode
+        # print("[GET_NEXT_BATCH_TO_RUN] new_batch is None, cannot prefill")
         if self.running_batch is None:
+            # print("[GET_NEXT_BATCH_TO_RUN] running_batch is None, return None")
             return None
         self.running_batch = self.update_running_batch(self.running_batch)
         return self.running_batch
@@ -802,16 +808,21 @@ class Scheduler:
         if (
             self.batch_is_full or len(self.waiting_queue) == 0
         ) and self.being_chunked_req is None:
+            # print("[GET_NEW_PREFILL] batch_is_full or len(waiting_queue) == 0")
             return None
+        
+        print("[GET_NEW_PREFILL] len(waiting_queue):", len(self.waiting_queue))
 
         running_bs = len(self.running_batch.reqs) if self.running_batch else 0
         if running_bs >= self.max_running_requests:
             self.batch_is_full = True
+            print("[GET_NEW_PREFILL] running_bs >= max_running_requests")
             return None
 
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
 
+        print("[GET_NEW_PREFILL] remaining total tokens:", self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size())
         # Prefill policy
         adder = PrefillAdder(
             self.tree_cache,
@@ -846,10 +857,12 @@ class Scheduler:
                 )
                 > self.max_loras_per_batch
             ):
+                print("[GET_NEW_PREFILL] len(lora_set) > self.max_loras_per_batch, set batch_is_full = True")
                 self.batch_is_full = True
                 break
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
+                print("[GET_NEW_PREFILL] running_bs + len(adder.can_run_list) >= self.max_running_requests, set batch_is_full = True")
                 self.batch_is_full = True
                 break
 
@@ -857,12 +870,14 @@ class Scheduler:
             res = adder.add_one_req(req)
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    print("[GET_NEW_PREFILL] res == AddReqResult.NO_TOKEN, set batch_is_full = True")
                     self.batch_is_full = True
                 break
 
         # Update waiting queue
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
+            print("[GET_NEW_PREFILL] len(can_run_list) == 0")
             return None
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -897,6 +912,7 @@ class Scheduler:
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+            print("Warning: mixed chunked prefill is enabled")
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -913,6 +929,7 @@ class Scheduler:
         global test_retract
 
         initial_bs = batch.batch_size()
+        print(f"[UPDATE_RUNNING_BATCH] initial_bs: {initial_bs}")
 
         batch.filter_batch()
         if batch.is_empty():
@@ -960,9 +977,11 @@ class Scheduler:
         if self.is_generation:
             model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                logits_output, next_token_ids, forward_batch = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+                model_worker_batch.update_from_forward_batch(forward_batch)
+                batch.update_from_model_worker_batch(model_worker_batch)
             elif batch.forward_mode.is_idle():
                 model_worker_batch = batch.get_model_worker_batch()
                 self.tp_worker.forward_batch_idle(model_worker_batch)
@@ -982,7 +1001,7 @@ class Scheduler:
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = embeddings, model_worker_batch.bid
-        return ret
+        return ret, batch
 
     def process_batch_result(self, batch: ScheduleBatch, result):
         if batch.forward_mode.is_decode():
@@ -1468,6 +1487,7 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    complete_token_manager: Optional[CompleteTokenQueryService] = None,
 ):
     # set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
@@ -1486,7 +1506,7 @@ def run_scheduler_process(
     parent_process = psutil.Process().parent()
 
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank, complete_token_manager)
         pipe_writer.send(
             {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
         )

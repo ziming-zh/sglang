@@ -28,6 +28,8 @@ from vllm.distributed import (
     set_custom_all_reduce,
 )
 
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.mixtral import MixtralForCausalLM
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -51,6 +53,7 @@ from sglang.srt.model_loader import get_model
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    CompleteTokenQueryService,
     enable_show_time_cost,
     get_available_gpu_memory,
     init_custom_process_group,
@@ -75,9 +78,11 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        complete_token_manager: Optional[CompleteTokenQueryService] = None,
     ):
         # Parse args
         self.model_config = model_config
+        self.complete_token_manager = complete_token_manager
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
@@ -181,6 +186,52 @@ class ModelRunner:
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
+       
+        # Create a queue for offloading tasks and a queue for results
+        
+        import torch.multiprocessing as mp
+        from python.sglang.srt.layers.fused_moe_triton.layer import cpu_offload_worker
+        
+        config=self.model.config
+        
+        # self.task_queue = mp.Queue(maxsize=1000)
+        # self.result_queue = [mp.Queue(maxsize=1000//config.num_hidden_layers) for _ in range(config.num_hidden_layers)]
+        self.task_metadata = [{} for _ in range(config.num_hidden_layers)]
+        self.cpu_result_buffer = [{} for _ in range(config.num_hidden_layers)]
+        
+        # Check the model type and set the attribute name accordingly
+        if isinstance(self.model, MixtralForCausalLM):
+            attr_name = "num_local_experts"
+            layer_name = "block_sparse_moe"
+        elif isinstance(self.model, DeepseekV2ForCausalLM):
+            attr_name = "n_routed_experts"
+            layer_name = "mlp"
+        else:
+            raise ValueError(f"Unsupported model type, current model is {type(self.model)}")
+
+        # Use getattr to get the number of experts dynamically from config
+        num_experts = getattr(config, attr_name)
+
+        # Initialize the weights based on the number of experts
+        self.w13_cpu = torch.randn(num_experts, 2 * config.intermediate_size, config.hidden_size, device='cpu')
+        self.w2_cpu = torch.randn(num_experts, config.hidden_size, config.intermediate_size, device='cpu')
+
+        
+        parent_task_pipe, child_task_pipe = mp.Pipe()
+        
+        self.worker_process = mp.Process(target=cpu_offload_worker, args=(child_task_pipe, self.complete_token_manager, self.w13_cpu, self.w2_cpu))
+        self.worker_process.daemon = True  # Daemon mode ensures the process exits when main script stops
+        self.worker_process.start()
+        
+        for layer in self.model.model.layers:
+            layer.parent_task_pipe = parent_task_pipe
+            layer.child_task_pipe = child_task_pipe
+            moe_layer = getattr(layer, layer_name)
+            if hasattr(moe_layer, "experts"):
+                moe_layer.experts.complete_token_manager = self.complete_token_manager
+                moe_layer.experts.quant_method.complete_token_manager = self.complete_token_manager
+            layer.task_metadata = self.task_metadata
+            layer.cpu_result_buffer = self.cpu_result_buffer
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -470,6 +521,12 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+        print(
+            f"cell_size={cell_size}, "
+            f"available_gpu_memory={available_gpu_memory}, "
+            f"total_gpu_memory={total_gpu_memory}, "
+            f"mem_fraction_static={self.mem_fraction_static}"
+        )
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
@@ -530,6 +587,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
+            print(f"[MLA TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
@@ -538,7 +596,16 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
+            self.linked_token_to_kv_pool = MLATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=f'cuda:{self.gpu_id + self.tp_size}',
+            )
         elif self.server_args.enable_double_sparsity:
+            print(f"[DoubleSparse TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
@@ -548,7 +615,17 @@ class ModelRunner:
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
             )
+            self.linked_token_to_kv_pool = DoubleSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=f'cuda:{self.gpu_id + self.tp_size}',
+                heavy_channel_num=self.server_args.ds_heavy_channel_num,
+            )
         else:
+            print(f"[MHA TokenToKVPool] Init with {self.max_total_num_tokens} tokens.")
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 dtype=self.kv_cache_dtype,
@@ -557,6 +634,19 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
             )
+            self.linked_token_to_kv_pool = MHATokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=f'cuda:{self.gpu_id + self.tp_size}',
+            )
+        self.model.model.linked_token_to_kv_pool = self.linked_token_to_kv_pool
+        self.model.model.token_to_kv_pool = self.token_to_kv_pool
+        print(
+            f"[MHA TokenToKVPool] Assign token_to_kv_pool to model {self.model.model}."
+        )
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

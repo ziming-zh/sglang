@@ -421,25 +421,25 @@ def fused_topk(
         token_expert_indicies,
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
-    del token_expert_indicies  # Not used. Will be used in the future.
-    
-    # Find indices where topk_ids >= 4
-    mask_4 = topk_ids >= 4
+    prune_topk = 4
+    # Find indices where topk_ids >= topk
+    mask_4 = topk_ids >= prune_topk
     indices_to_change = mask_4.nonzero(as_tuple=True)
-
     if is_decode_mode:
-        num_to_change = int(mask_4.sum() * 19 / 20)  # Compute 19/20 of occurrences
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
+        num_tokens = topk_ids.shape[0]
+        num_to_force_miss = int(num_tokens * 0.1)  # 20% will be forced misses
 
-        if num_to_change > 0:
-            # Sort indices lexicographically for deterministic selection
-            sorted_indices = torch.argsort(indices_to_change[0] * topk + indices_to_change[1])
-
-            # Select the first num_to_change elements
-            selected_indices = sorted_indices[:num_to_change]
-            topk_ids[indices_to_change[0][selected_indices], indices_to_change[1][selected_indices]] -= 4
+        if num_to_force_miss > 0:
+            # Faster random selection
+            prob = torch.ones(num_tokens, device=topk_ids.device)
+            rand_indices = torch.multinomial(prob, num_to_force_miss, replacement=False)
+            # For these tokens, force both expert IDs to be within `prune_topk` range (modding ensures pruning)
+            topk_ids[rand_indices,1] = prune_topk + 1
     else:
-        topk_ids[mask_4] -= 4
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
 
+    del token_expert_indicies  # Not used. Will be used in the future.
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -454,8 +454,8 @@ def grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    is_decode_mode: bool = False,
 ):
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
@@ -476,10 +476,28 @@ def grouped_topk(
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
 
+    prune_topk = 32 # default to 32 for DS-V4 (50% pruning for DS-V2)
+    # Find indices where topk_ids >= prune_topk
+    mask_4 = topk_ids >= prune_topk
+    if is_decode_mode:
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
+        num_tokens = topk_ids.shape[0]
+        num_to_force_miss = int(num_tokens * 0.1)  # 10% will be forced misses
+
+        if num_to_force_miss > 0:
+            # Faster random selection
+            prob = torch.ones(num_tokens, device=topk_ids.device)
+            rand_indices = torch.multinomial(prob, num_to_force_miss, replacement=False)
+            # For these tokens, force both expert IDs to be within `prune_topk` range (modding ensures pruning)
+            topk_ids[rand_indices, 1] = prune_topk + 1
+    else:
+        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
+
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
 
 
 def get_config_dtype_str(
