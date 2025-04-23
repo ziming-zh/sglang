@@ -150,10 +150,13 @@ class DeepseekV2MoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states, residual, forward_batch = (
-            self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=parent_task_pipe, task_metadata=task_metadata, cpu_result_buffer=cpu_result_buffer)
+        print(f"hidden_states.shape: {hidden_states.shape}",flush=True)
+        val, residual, forward_batch = self.experts(hidden_states, router_logits, is_decode_mode=is_decode_mode, residual=residual, forward_batch=forward_batch, parent_task_pipe=parent_task_pipe, task_metadata=task_metadata, cpu_result_buffer=cpu_result_buffer)
+        final_hidden_states = (
+            val
             * self.routed_scaling_factor
         )
+        print(f"final_hidden_states.shape: {final_hidden_states.shape}",flush=True)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -758,7 +761,18 @@ class DeepseekV2DecoderLayer(nn.Module):
                     
             hidden_states = hidden_states[start_idx:end_idx]
         else:
-            hidden_states = self.mlp(hidden_states)
+            if not isinstance(self.mlp, DeepseekV2MoE):
+                hidden_states = self.mlp(hidden_states)
+            else:
+                hidden_states, residual, forward_batch = self.mlp(
+                    hidden_states,
+                    is_decode_mode=forward_batch.forward_mode.is_decode(),
+                    residual=residual,
+                    forward_batch=forward_batch,
+                    parent_task_pipe=self.parent_task_pipe, 
+                    task_metadata=self.task_metadata,
+                    cpu_result_buffer=self.cpu_result_buffer
+                )
 
         return hidden_states, residual, forward_batch
 
@@ -806,7 +820,7 @@ class DeepseekV2Model(nn.Module):
         event = torch.cuda.Event()
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            stride_begin_idx = range(8, self.layers, 8)
+            stride_begin_idx = range(8, len(self.layers), 8)
             if i in [x-1 for x in stride_begin_idx]:
                 print(f"[DS-V2 Model]Layer {i} begin kv migration")
 

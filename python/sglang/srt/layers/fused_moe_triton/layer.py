@@ -1186,6 +1186,7 @@ class FusedMoE(torch.nn.Module):
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                is_decode_mode=is_decode_mode,
             )
         elif custom_routing_function is None:
             topk_weights, topk_ids = fused_topk(

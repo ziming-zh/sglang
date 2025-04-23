@@ -475,17 +475,28 @@ def swap_inactive_requests_token_indices(
     if len(flat_tokens_2) > 0:
         pool2.free(flat_tokens_2)
 
-    # Copy actual KV data
-    for k1, v1, k2, v2 in zip(
-        pool1.k_buffer[layer_id:layer_id + stride_num],
-        pool1.v_buffer[layer_id:layer_id + stride_num],
-        pool2.k_buffer[layer_id:layer_id + stride_num],
-        pool2.v_buffer[layer_id:layer_id + stride_num]
-    ):
-        k1[new_locs_1] = k2[flat_tokens_2.to(k2.device)].to(k1.device)
-        v1[new_locs_1] = v2[flat_tokens_2.to(v2.device)].to(v1.device)
-        k2[new_locs_2] = k1[flat_tokens_1.to(k1.device)].to(k2.device)
-        v2[new_locs_2] = v1[flat_tokens_1.to(v1.device)].to(v2.device)
+    # Check if pool1 and pool2 are MLATokenToKVPool
+    if hasattr(pool1, "kv_buffer"):
+        buffer1 = pool1.kv_buffer
+    else:
+        buffer1 = zip(pool1.k_buffer[layer_id:layer_id + stride_num], pool1.v_buffer[layer_id:layer_id + stride_num])
+    
+    if hasattr(pool2, "kv_buffer"):
+        buffer2 = pool2.kv_buffer
+    else:
+        buffer2 = zip(pool2.k_buffer[layer_id:layer_id + stride_num], pool2.v_buffer[layer_id:layer_id + stride_num])
+    
+    if hasattr(pool1, "kv_buffer") and hasattr(pool2, "kv_buffer"):
+        for kv1, kv2 in zip(buffer1, buffer2):
+            kv1[new_locs_1] = kv2[flat_tokens_2.to(kv2.device)].to(kv1.device)
+            kv2[new_locs_2] = kv1[flat_tokens_1.to(kv1.device)].to(kv2.device)
+    else:
+        # Copy actual KV data (from kv_buffer when MLATokenToKVPool, otherwise from k_buffer and v_buffer)
+        for (k1, v1), (k2, v2) in zip(buffer1, buffer2):
+            k1[new_locs_1] = k2[flat_tokens_2.to(k2.device)].to(k1.device)
+            v1[new_locs_1] = v2[flat_tokens_2.to(v2.device)].to(v1.device)
+            k2[new_locs_2] = k1[flat_tokens_1.to(k1.device)].to(k2.device)
+            v2[new_locs_2] = v1[flat_tokens_1.to(v1.device)].to(v2.device)
 
     # Rebuild request-to-token-index mapping
     def rebuild_mapping(old_mapping, spans, flat_locs):
