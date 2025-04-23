@@ -148,6 +148,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
+            forward_batch.shared_expert_output = shared_output
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         print(f"hidden_states.shape: {hidden_states.shape}",flush=True)
@@ -156,12 +157,14 @@ class DeepseekV2MoE(nn.Module):
             val
             * self.routed_scaling_factor
         )
+        shared_output = forward_batch.shared_expert_output
         print(f"final_hidden_states.shape: {final_hidden_states.shape}",flush=True)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
+        
+        num_tokens = final_hidden_states.shape[0]
         return final_hidden_states.view(num_tokens, hidden_dim), residual, forward_batch
 
 

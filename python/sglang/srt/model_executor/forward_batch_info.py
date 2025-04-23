@@ -216,6 +216,11 @@ class ForwardBatch:
         # local_batch.image_inputs, remote_batch.image_inputs = split_list(self.image_inputs)
         # local_batch.lora_paths, remote_batch.lora_paths = split_list(self.lora_paths)
         
+        if hasattr(self, "shared_expert_output"):
+            local_batch.shared_expert_output, remote_batch.shared_expert_output = split_tensor(
+                self.shared_expert_output
+            )
+        
 
         # Compute new batch sizes
         local_batch.batch_size = local_batch.input_ids.shape[0] if local_batch.input_ids is not None else 0
@@ -259,6 +264,9 @@ class ForwardBatch:
         positions_list = [self.positions] if is_valid_tensor(self.positions) else []
         out_cache_loc_list = [self.out_cache_loc] if is_valid_tensor(self.out_cache_loc) else []
         req_pool_indices_list = [self.req_pool_indices] if is_valid_tensor(self.req_pool_indices) else []
+        
+        if hasattr(self, "shared_expert_output"):
+            shared_expert_output_list = [self.shared_expert_output] if is_valid_tensor(self.shared_expert_output) else []
 
         # Collect tensors from other batches
         for other in fb_list:
@@ -272,7 +280,8 @@ class ForwardBatch:
                 out_cache_loc_list.append(other.out_cache_loc)
             if is_valid_tensor(other.req_pool_indices):
                 req_pool_indices_list.append(other.req_pool_indices)
-
+            if hasattr(other, "shared_expert_output") and is_valid_tensor(other.shared_expert_output):
+                shared_expert_output_list.append(other.shared_expert_output)
         # Pre-allocate memory and combine tensors
         def combine_tensors(tensor_list):
             if not tensor_list:
@@ -307,6 +316,11 @@ class ForwardBatch:
         self.positions = combine_tensors(positions_list)
         self.out_cache_loc = combine_tensors(out_cache_loc_list)
         self.req_pool_indices = combine_tensors(req_pool_indices_list)
+        
+        if hasattr(self, "shared_expert_output"):
+            # print out the shape of every tensor in shared_expert_output_list
+            # print(f"[COMBINE] shared_expert_output_list: {[t.shape for t in shared_expert_output_list]}", flush=True)
+            self.shared_expert_output = torch.cat(shared_expert_output_list, dim=0) if shared_expert_output_list else None
 
         # Handle non-tensor attributes
         self.image_inputs = self.image_inputs if self.image_inputs is not None else []
