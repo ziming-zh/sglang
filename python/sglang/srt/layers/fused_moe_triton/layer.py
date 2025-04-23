@@ -1203,31 +1203,26 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize,
             )
-        # Adjust for pruned experts
-        topk_ids_adjusted = []
-        is_remote = [False] * len(topk_ids)
-        
-        for token_idx, token_topk_ids in enumerate(topk_ids):
-            for expert_id in token_topk_ids:
-                if not self.available_experts[expert_id]:
-                    # print(f"[WARNING] Token {token_idx} has pruned expert {expert_id}.")
-                    is_remote[token_idx] = True
-            
-            # adjusted_ids = [
-            #     expert_id for expert_id in token_topk_ids if self.available_experts[expert_id]
-            # ]
-            # # If no available expert, fallback to the first available expert
-            # if len(adjusted_ids) < top_k:
-            #     print(f"[WARNING] Token {token_idx} has less than {top_k} available experts.")
-            #     adjusted_ids += [
-            #         idx for idx, available in enumerate(self.available_experts) if available
-            #     ][: top_k - len(adjusted_ids)]
-            # topk_ids_adjusted.append(adjusted_ids)
+        # Efficient expert ID filtering and fallback
+        available_mask = torch.tensor(self.available_experts, device=topk_ids.device)
+        is_available = available_mask[topk_ids]  # shape: [B, K]
+        is_remote = ~is_available.all(dim=1)
+        masked_topk_ids = topk_ids.clone()
+        masked_topk_ids[~is_available] = -1
 
-        # topk_ids = torch.tensor(topk_ids_adjusted, device=router_logits.device)
-        
-        is_remote = torch.tensor(is_remote, device=router_logits.device)
-        # print(f"topk_ids: {topk_ids}")
+        valid_counts = (masked_topk_ids != -1).sum(dim=1)
+
+        fallback_experts = torch.nonzero(available_mask, as_tuple=False).flatten()
+        if fallback_experts.numel() < top_k:
+            raise RuntimeError("Not enough available experts to satisfy top_k fallback.")
+
+        fallback_matrix = fallback_experts[:top_k].repeat(topk_ids.size(0), 1)
+
+        # Replace -1s with fallback expert ids
+        fallback_mask = (masked_topk_ids == -1)
+        topk_ids = masked_topk_ids.clone()
+        topk_ids[fallback_mask] = fallback_matrix[fallback_mask].to(topk_ids.dtype)
+
         return topk_weights, topk_ids, is_remote
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, parent_task_pipe: Optional[mp.Pipe] = None, task_metadata: Optional[list] = None, cpu_result_buffer: Optional[dict] = None):
