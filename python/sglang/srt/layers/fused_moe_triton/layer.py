@@ -577,21 +577,25 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize,
             )
-        # Adjust for pruned experts
-        topk_ids_adjusted = []
-        for token_idx, token_topk_ids in enumerate(topk_ids):
-            adjusted_ids = [
-                expert_id for expert_id in token_topk_ids if self.available_experts[expert_id]
-            ]
-            # If no available expert, fallback to the first available expert
-            if len(adjusted_ids) < top_k:
-                adjusted_ids += [
-                    idx for idx, available in enumerate(self.available_experts) if available
-                ][: top_k - len(adjusted_ids)]
-            topk_ids_adjusted.append(adjusted_ids)
+        # Efficient expert ID filtering and fallback
+        available_mask = torch.tensor(self.available_experts, device=topk_ids.device)
+        is_available = available_mask[topk_ids]  # shape: [B, K]
+        masked_topk_ids = topk_ids.clone()
+        masked_topk_ids[~is_available] = -1
 
-        topk_ids = torch.tensor(topk_ids_adjusted, device=router_logits.device)
-        print(f"topk_ids: {topk_ids}")
+        valid_counts = (masked_topk_ids != -1).sum(dim=1)
+
+        fallback_experts = torch.nonzero(available_mask, as_tuple=False).flatten()
+        if fallback_experts.numel() < top_k:
+            raise RuntimeError("Not enough available experts to satisfy top_k fallback.")
+
+        fallback_matrix = fallback_experts[:top_k].repeat(topk_ids.size(0), 1)
+
+        # Replace -1s with fallback expert ids
+        fallback_mask = (masked_topk_ids == -1)
+        topk_ids = masked_topk_ids.clone()
+        topk_ids[fallback_mask] = fallback_matrix[fallback_mask].to(topk_ids.dtype)
+
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
