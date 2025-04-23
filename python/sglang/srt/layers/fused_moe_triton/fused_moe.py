@@ -476,7 +476,7 @@ def grouped_topk(
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
 
-    prune_topk = 4
+    prune_topk = 32 # default to 32 for DS-V4 (50% pruning for DS-V2)
     # Find indices where topk_ids >= prune_topk
     mask_4 = topk_ids >= prune_topk
     if is_decode_mode:
