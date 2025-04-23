@@ -412,6 +412,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         cpu_result_buffer: Optional[list] = None,
     ) -> torch.Tensor:
         forward_cuda_start = time.time()
+        
+        select_expert_start = time.time()
         self.round_id += 1
         topk_weights, topk_ids, is_remote_toks = layer.select_experts(
             hidden_states=x,
@@ -424,28 +426,61 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             is_decode_mode=is_decode_mode,
         )
+        select_expert_end = time.time()
+        print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
         self.parent_task_pipe = parent_task_pipe
         self.task_metadata = task_metadata
         self.cpu_buffer = cpu_result_buffer
-        # make sure is_remote_toks on the same device as x
-        is_remote_toks = is_remote_toks.to(x.device)
-
-        x_remote = x[is_remote_toks]
-        x_local = x[~is_remote_toks]
-        print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
-        num_seqs = x.shape[0]
-
-        topk_weights_remote = topk_weights[is_remote_toks]
-        topk_ids_remote = topk_ids[is_remote_toks]
-
-        topk_weights_local = topk_weights[~is_remote_toks]
-        topk_ids_local = topk_ids[~is_remote_toks]
         if is_decode_mode:
-            forward_batch_local, forward_batch_remote = forward_batch.split(is_remote_toks)
+            if is_remote_toks.device != x.device:
+                is_remote_toks = is_remote_toks.to(x.device)
+            remote_idx = is_remote_toks.nonzero(as_tuple=True)[0]
+            local_idx = (~is_remote_toks).nonzero(as_tuple=True)[0]
+
+            x_remote = x.index_select(0, remote_idx)
+            x_local = x.index_select(0, local_idx)
+            topk_weights_remote = topk_weights.index_select(0, remote_idx)
+            topk_ids_remote = topk_ids.index_select(0, remote_idx)
+            topk_weights_local = topk_weights.index_select(0, local_idx)
+            topk_ids_local = topk_ids.index_select(0, local_idx)
+            
+            real_split_start = time.time()
+            forward_batch_local, forward_batch_remote = forward_batch.split(remote_idx, local_idx)
+            real_split_end = time.time()
+            print(f"[Layer {self.layer_id}] Split forward_batch in {real_split_end-real_split_start} seconds")
+
+            print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+            num_seqs = x.size(0)
+
         else:
+            x_remote = None
+            x_local = x
+            topk_weights_remote = None
+            topk_ids_remote = None
+            topk_weights_local = topk_weights
+            topk_ids_local = topk_ids
             forward_batch_local = forward_batch
             forward_batch_remote = None
         # print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}, cuda {x_local.device}")
+        
+        computation_start = time.time()
+        # Create or use an existing dedicated stream
+        if not hasattr(self, "stream_fused"):
+            self.stream_fused = torch.cuda.Stream()
+
+        # Launch fused_experts asynchronously
+        with torch.cuda.stream(self.stream_fused):
+            x_local = fused_experts(
+                hidden_states=x_local,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights_local,
+                topk_ids=topk_ids_local,
+                inplace=True,
+            )
+        computation_end = time.time()
+        print(f"[Layer {self.layer_id}] Computation on GPU in {computation_end-computation_start} seconds")
+        
             
         if residual is not None:
             residual_remote = residual[is_remote_toks]
@@ -453,6 +488,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             residual_remote = None
             residual_local = None
+
+        select_expert_end = time.time()
+        print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
 
         if is_decode_mode:
             
@@ -529,18 +567,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.remote_forward_batch = None
             
             split_end = time.time()
-            # print(f"[Layer {self.layer_id}] Split remote tokens from {split_start} to {split_end} in {split_end-split_start} seconds")
-            
-        # do computation on GPU
-        x_local = fused_experts(
-            hidden_states=x_local,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights_local,
-            topk_ids=topk_ids_local,
-            inplace=True,
-        )
+            print(f"[Layer {self.layer_id}] Split remote in {split_end-split_start} seconds")
         
+        torch.cuda.current_stream().wait_stream(self.stream_fused)
         if is_decode_mode:
 
             # retrieve results from the worker process
@@ -573,9 +602,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.retrieve_results()
             
             retrieval_end = time.time()
-            # print(f"[Layer {self.layer_id}] Retrieved results from {retrieval_start} to {retrieval_end} in {retrieval_end-retrieval_start} seconds")
+            print(f"[Layer {self.layer_id}] Retrieved results in {retrieval_end-retrieval_start} seconds")
             # combination
-            # combination_start = time.time()
+            combination_start = time.time()
                 
 
             for key in finished_tasks:
@@ -610,14 +639,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 forward_batch_local.combine(fetched_forward_batch)
                 # print(f"[Combine after] fetched_batch_local.out_cache_loc: {forward_batch_local.out_cache_loc}")
                 # synchronize streams
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
                     
             # print(f"[FORWARD_CUDA] local input shape after combine", x_local.shape)
             # print(f"[FORWARD_CUDA] local forward_batch", forward_batch_local.out_cache_loc) 
             
             # forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
             # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
-            # combination_end = time.time()
+            combination_end = time.time()
+            print(f"[Layer {self.layer_id}] Combined remote results in {combination_end-combination_start} seconds")
             # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Combination time: {combination_end-combination_start} seconds")
         forward_cuda_end = time.time()
         print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")

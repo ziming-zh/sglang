@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple, Optional, List
+from copy import deepcopy
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 
@@ -154,36 +156,32 @@ class ForwardBatch:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
-
-    def split(self, mask: torch.Tensor) -> Tuple["ForwardBatch", "ForwardBatch"]:
+    def split(self, remote_idx: torch.Tensor, local_idx: torch.Tensor) -> Tuple["ForwardBatch", "ForwardBatch"]:
         """
-        Splits the ForwardBatch into local and remote batches based on a binary mask.
-        
+        Splits the ForwardBatch into local and remote batches using integer indices.
+
         Args:
-            mask (torch.Tensor): A binary tensor where 1 indicates local and 0 indicates remote.
+            remote_idx (torch.Tensor): 1D tensor of indices for remote tokens.
+            local_idx (torch.Tensor): 1D tensor of indices for local tokens.
 
         Returns:
             Tuple[ForwardBatch, ForwardBatch]: The local and remote batches.
         """
-        assert mask.shape == self.input_ids.shape, "Mask shape must match input_ids shape"
-
-        remote_mask = mask.bool()
-        local_mask = ~remote_mask
 
         def split_tensor(tensor: Optional[torch.Tensor]):
             if tensor is None:
                 return None, None
-            local_tensor = tensor[local_mask].clone() if local_mask.any() else None
-            remote_tensor = tensor[remote_mask].clone() if remote_mask.any() else None
-            return local_tensor, remote_tensor
-
+            return (
+                tensor.index_select(0, local_idx).clone() if local_idx.numel() > 0 else None,
+                tensor.index_select(0, remote_idx).clone() if remote_idx.numel() > 0 else None,
+            )
         def split_list(lst: Optional[List]):
             if lst is None:
                 return None, None
-            assert len(lst) == len(mask), "List length must match mask length"
-            return ([lst[i] for i in range(len(lst)) if not mask[i].item()] if lst is not None else None,
-                    [lst[i] for i in range(len(lst)) if mask[i].item()] if lst is not None else None)
-
+            return (
+                [lst[i] for i in local_idx.tolist()] if local_idx.numel() > 0 else None,
+                [lst[i] for i in remote_idx.tolist()] if remote_idx.numel() > 0 else None,
+            )
 
         
         local_batch = self
@@ -238,6 +236,7 @@ class ForwardBatch:
         # remote_batch.sampling_info = self.sampling_info.filter_batch(remove_indices_list, remove_indices)
 
         return local_batch, remote_batch
+
 
     def combine(self, fb_list: list["ForwardBatch"]) -> None:
         """

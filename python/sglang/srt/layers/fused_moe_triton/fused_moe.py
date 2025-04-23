@@ -422,22 +422,20 @@ def fused_topk(
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
     prune_topk = 4
-    # Find indices where topk_ids >= topk
-    mask_4 = topk_ids >= prune_topk
-    indices_to_change = mask_4.nonzero(as_tuple=True)
-    if is_decode_mode:
-        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
-        num_tokens = topk_ids.shape[0]
-        num_to_force_miss = int(num_tokens * 0.1)  # 20% will be forced misses
+    num_tokens, k = topk_ids.shape
 
+    # Vectorized pruning of out-of-range expert IDs
+    mask_overflow = topk_ids >= prune_topk
+    topk_ids[mask_overflow] %= prune_topk  # Fast in-place mod
+
+    if is_decode_mode:
+        num_to_force_miss = int(num_tokens * 0.1)
         if num_to_force_miss > 0:
-            # Faster random selection
-            prob = torch.ones(num_tokens, device=topk_ids.device)
-            rand_indices = torch.multinomial(prob, num_to_force_miss, replacement=False)
-            # For these tokens, force both expert IDs to be within `prune_topk` range (modding ensures pruning)
-            topk_ids[rand_indices,1] = prune_topk + 1
-    else:
-        topk_ids[mask_4] = topk_ids[mask_4] % prune_topk
+            # Generate random token indices to force miss
+            rand_indices = torch.randint(0, num_tokens, (num_to_force_miss,), device=topk_ids.device)
+
+            # Assign an invalid expert ID (> prune_topk) at position 1 for these tokens
+            topk_ids[rand_indices, 1] = prune_topk + 1
 
     del token_expert_indicies  # Not used. Will be used in the future.
     if renormalize:
