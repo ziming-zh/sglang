@@ -109,7 +109,7 @@ def split_rows_kernel(
     input_ptr,       # pointer to [N, D] input
     index_ptr,       # pointer to [K] indices
     output_ptr,      # pointer to [K, D] output
-    N: tl.constexpr, # number of rows in input
+    N, # number of rows in input
     D: tl.constexpr, # number of columns per row
 ):
     pid = tl.program_id(0)
@@ -122,34 +122,34 @@ def split_rows_kernel(
     tl.store(output_ptr + out_start + offsets, in_vals)
 
 def split_tensor_triton(tensor: torch.Tensor, local_idx: torch.Tensor, remote_idx: torch.Tensor):
-    local_len = local_idx.numel()
-    remote_len = remote_idx.numel()
-    assert local_len + remote_len == tensor.shape[0], "Indices must cover the entire tensor"
+    # local_len = local_idx.numel()
+    # remote_len = remote_idx.numel()
+    # assert local_len + remote_len == tensor.shape[0], "Indices must cover the entire tensor"
     
-    local_tensor = tensor[:local_len] if local_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
-    remote_tensor = tensor[local_len:] if remote_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
+    # local_tensor = tensor[:local_len] if local_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
+    # remote_tensor = tensor[local_len:] if remote_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
     
-    return local_tensor, remote_tensor
-
-    # if tensor.ndim == 1:
-    local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
-    remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
-    return local_tensor, remote_tensor
-    # N, D = tensor.shape
-    # device = tensor.device
-
-    # def run_split(index_tensor):
-    #     K = index_tensor.shape[0]
-    #     if K == 0:
-    #         return tensor.new_empty((0, D))
-    #     output = torch.empty((K, D), dtype=tensor.dtype, device=device)
-    #     grid = lambda meta: (K,)
-    #     split_rows_kernel[grid](tensor, index_tensor, output, N, D)
-    #     return output
-
-    # local_tensor = run_split(local_idx)
-    # remote_tensor = run_split(remote_idx)
     # return local_tensor, remote_tensor
+
+    if tensor.ndim == 1:
+        local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
+        remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
+        return local_tensor, remote_tensor
+    N, D = tensor.shape
+    device = tensor.device
+
+    def run_split(index_tensor):
+        K = index_tensor.shape[0]
+        if K == 0:
+            return tensor.new_empty((0, D))
+        output = torch.empty((K, D), dtype=tensor.dtype, device=device)
+        grid = lambda meta: (K,)
+        split_rows_kernel[grid](tensor, index_tensor, output, N, D)
+        return output
+
+    local_tensor = run_split(local_idx)
+    remote_tensor = run_split(remote_idx)
+    return local_tensor, remote_tensor
 
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
