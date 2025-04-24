@@ -48,6 +48,63 @@ TORCH_TO_NUMPY_DTYPE = {
 }
 
 @triton.jit
+def fallback_replace_kernel(
+    topk_ids_ptr,         # [B, K] int32
+    available_ptr,        # [N] bool
+    fallback_ptr,         # [K] int32
+    output_ids_ptr,       # [B, K] int32
+    is_remote_ptr,        # [B] bool
+    B,
+    K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    if pid >= B:
+        return
+
+    row_offset = pid * K
+    is_row_remote = tl.full((), False, tl.int1)  # ensure it's int1
+
+    for i in range(K):
+        expert_id = tl.load(topk_ids_ptr + row_offset + i)
+        is_valid = tl.load(available_ptr + expert_id).to(tl.int1)
+        fallback_id = tl.load(fallback_ptr + i)
+
+        final_id = tl.where(is_valid, expert_id, fallback_id)
+        tl.store(output_ids_ptr + row_offset + i, final_id)
+
+        is_row_remote = is_row_remote | (~is_valid).to(tl.int1)
+
+    tl.store(is_remote_ptr + pid, is_row_remote)
+
+
+def triton_fallback_replace(topk_ids: torch.Tensor, available_mask: torch.Tensor, fallback_experts: torch.Tensor):
+    B = topk_ids.shape[0]
+    K = topk_ids.shape[1]
+    device = topk_ids.device
+
+    output_ids = torch.empty_like(topk_ids)
+    is_remote = torch.empty((B,), dtype=torch.bool, device=device)
+
+    # Make sure fallback_experts is [K]
+    assert fallback_experts.shape[0] >= K
+    fallback_trimmed = fallback_experts[:K].contiguous()
+
+    grid = lambda meta: (B,)
+
+    fallback_replace_kernel[grid](
+        topk_ids,
+        available_mask.to(torch.bool),
+        fallback_trimmed,
+        output_ids,
+        is_remote,
+        B=B,
+        K=K,
+    )
+
+    return output_ids, is_remote
+
+@triton.jit
 def split_rows_kernel(
     input_ptr,       # pointer to [N, D] input
     index_ptr,       # pointer to [K] indices
@@ -65,6 +122,15 @@ def split_rows_kernel(
     tl.store(output_ptr + out_start + offsets, in_vals)
 
 def split_tensor_triton(tensor: torch.Tensor, local_idx: torch.Tensor, remote_idx: torch.Tensor):
+    local_len = local_idx.numel()
+    remote_len = remote_idx.numel()
+    assert local_len + remote_len == tensor.shape[0], "Indices must cover the entire tensor"
+    
+    local_tensor = tensor[:local_len] if local_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
+    remote_tensor = tensor[local_len:] if remote_len > 0 else tensor.new_empty((0,) + tensor.shape[1:])
+    
+    return local_tensor, remote_tensor
+
     # if tensor.ndim == 1:
     local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
     remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
@@ -467,13 +533,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             is_decode_mode=is_decode_mode,
         )
         select_expert_end = time.time()
-        print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
+        # print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
         self.parent_task_pipe = parent_task_pipe
         self.task_metadata = task_metadata
         self.cpu_buffer = cpu_result_buffer
+        device = x.device
         if is_decode_mode:
             remote_idx = torch.where(is_remote_toks)[0]
             local_idx = torch.where(~is_remote_toks)[0]
+            self.remote_idx = remote_idx
+            self.local_idx = local_idx
             # assert remote_idx and local_idx all on gpu
             assert remote_idx.device == x.device
             assert local_idx.device == x.device
@@ -481,23 +550,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights, local_idx, remote_idx
             )
             split_weight_end = time.time()
-            print(f"[Layer {self.layer_id}] Split topk_weights in {split_weight_end-select_expert_end} seconds")
+            # print(f"[Layer {self.layer_id}] Split topk_weights in {split_weight_end-select_expert_end} seconds")
             topk_ids_local, topk_ids_remote = split_tensor_triton(
                 topk_ids, local_idx, remote_idx
             )
             split_id_end = time.time()
-            print(f"[Layer {self.layer_id}] Split topk_ids in {split_id_end-split_weight_end} seconds")
+            # print(f"[Layer {self.layer_id}] Split topk_ids in {split_id_end-split_weight_end} seconds")
             x_local, x_remote = split_tensor_triton(
                 x, local_idx, remote_idx
             )
             split_x_end = time.time()
-            print(f"[Layer {self.layer_id}] Split x in {split_x_end-split_id_end} seconds")
+            # print(f"[Layer {self.layer_id}] Split x in {split_x_end-split_id_end} seconds")
             
-            
-            real_split_start = time.time()
-            forward_batch_local, forward_batch_remote = forward_batch.split(remote_idx, local_idx)
-            real_split_end = time.time()
-            print(f"[Layer {self.layer_id}] Split forward_batch in {real_split_end-real_split_start} seconds")
+            if not hasattr(self, "split_stream"):
+                self.split_stream = torch.cuda.Stream()
+            with torch.cuda.stream(self.split_stream):
+                real_split_start = time.time()
+                forward_batch_local, forward_batch_remote = forward_batch.split(remote_idx, local_idx)
+                real_split_end = time.time()
+            # print(f"[Layer {self.layer_id}] Split forward_batch in {real_split_end-real_split_start} seconds")
 
             print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
             num_seqs = x.size(0)
@@ -512,7 +583,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             forward_batch_local = forward_batch
             forward_batch_remote = None
         # print(f"forward_batch_local: {forward_batch_local}, forward_batch_remote: {forward_batch_remote}, cuda {x_local.device}")
-        
+        x_local_numel = x_local.numel()
         computation_start = time.time()
         # Create or use an existing dedicated stream
         if not hasattr(self, "stream_fused"):
@@ -529,17 +600,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 inplace=True,
             )
         computation_end = time.time()
-        print(f"[Layer {self.layer_id}] Computation on GPU in {computation_end-computation_start} seconds")
+        # print(f"[Layer {self.layer_id}] Computation on GPU in {computation_end-computation_start} seconds")
         
             
         if residual is not None:
             if is_decode_mode:
                 if is_remote_toks.device != x.device:
                     is_remote_toks = is_remote_toks.to(x.device)
-                remote_idx = is_remote_toks.nonzero(as_tuple=True)[0]
-                local_idx = (~is_remote_toks).nonzero(as_tuple=True)[0]
                 residual_local, residual_remote = split_tensor_triton(
-                    residual, local_idx, remote_idx
+                    residual, self.local_idx, self.remote_idx
                 )
             else:
                 residual_remote = None
@@ -549,7 +618,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             residual_local = None
 
         select_expert_end = time.time()
-        print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
+        # print(f"[Layer {self.layer_id}] Select experts in {select_expert_end-select_expert_start} seconds")
 
         if is_decode_mode:
             
@@ -626,9 +695,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.remote_forward_batch = None
             
             split_end = time.time()
-            print(f"[Layer {self.layer_id}] Split remote in {split_end-split_start} seconds")
+            # print(f"[Layer {self.layer_id}] Split remote in {split_end-split_start} seconds")
         
-        torch.cuda.current_stream().wait_stream(self.stream_fused)
+        
         if is_decode_mode:
 
             # retrieve results from the worker process
@@ -642,7 +711,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             fetched_cpu_results = []
             fetched_residuals = []
             fetched_forward_batch = []
-            device = x_local.device
             self.retrieve_results()
             # query_and_retrieve_start = time.time()
             finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
@@ -651,7 +719,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             self.retrieve_results()
             # query_and_retrieve_end = time.time()
             # print(f"[Layer {self.layer_id}] Query and retrieve from {query_and_retrieve_start} to {query_and_retrieve_end} in {query_and_retrieve_end-query_and_retrieve_start} seconds")
-            while not x_local.numel() and len(finished_tasks)<int(num_seqs*0.9)+1:
+            while not x_local_numel and len(finished_tasks)<int(num_seqs*0.9)+1:
                 time.sleep(0.01)
                 self.round_id += 1
                 self.retrieve_results()
@@ -661,7 +729,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.retrieve_results()
             
             retrieval_end = time.time()
-            print(f"[Layer {self.layer_id}] Retrieved results in {retrieval_end-retrieval_start} seconds")
+            # print(f"[Layer {self.layer_id}] Retrieved results in {retrieval_end-retrieval_start} seconds")
             # combination
             combination_start = time.time()
                 
@@ -686,8 +754,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 fetched_forward_batch.append(forward_batch_remote)
                 # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
                 del self.cpu_buffer[self.layer_id][key]
-            
-
+        
+        torch.cuda.current_stream().wait_stream(self.stream_fused)
+        if is_decode_mode:
             if len(fetched_cpu_results) > 0:
                 # print(f"[Layer {self.layer_id}] Combined {len(fetched_cpu_results)} remote results at {time.time()}")
                 # print(f"fetched_gpu_results: {fetched_cpu_results}")
@@ -706,7 +775,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # forward_batch_local.is_local_toks = (~is_remote_toks).nonzero(as_tuple=True)[0]
             # print(f"[FORWARD_CUDA] local forward_batch.is_local_toks", forward_batch_local.is_local_toks)
             combination_end = time.time()
-            print(f"[Layer {self.layer_id}] Combined remote results in {combination_end-combination_start} seconds")
+            # print(f"[Layer {self.layer_id}] Combined remote results in {combination_end-combination_start} seconds")
             # print(f"[TP-RANK {get_tensor_model_parallel_rank()}] Combination time: {combination_end-combination_start} seconds")
         forward_cuda_end = time.time()
         print(f"[Layer {self.layer_id}] Forward CUDA from {forward_cuda_start} to {forward_cuda_end} in {forward_cuda_end-forward_cuda_start} seconds")
@@ -1294,25 +1363,10 @@ class FusedMoE(torch.nn.Module):
             )
         # Efficient expert ID filtering and fallback
         available_mask = torch.tensor(self.available_experts, device=topk_ids.device)
-        is_available = available_mask[topk_ids]  # shape: [B, K]
-        is_remote = ~is_available.all(dim=1)
-        masked_topk_ids = topk_ids.clone()
-        masked_topk_ids[~is_available] = -1
+        fallback_experts = torch.nonzero(available_mask).flatten()
+        adjusted_ids, is_remote = triton_fallback_replace(topk_ids, available_mask, fallback_experts)
 
-        valid_counts = (masked_topk_ids != -1).sum(dim=1)
-
-        fallback_experts = torch.nonzero(available_mask, as_tuple=False).flatten()
-        if fallback_experts.numel() < top_k:
-            raise RuntimeError("Not enough available experts to satisfy top_k fallback.")
-
-        fallback_matrix = fallback_experts[:top_k].repeat(topk_ids.size(0), 1)
-
-        # Replace -1s with fallback expert ids
-        fallback_mask = (masked_topk_ids == -1)
-        topk_ids = masked_topk_ids.clone()
-        topk_ids[fallback_mask] = fallback_matrix[fallback_mask].to(topk_ids.dtype)
-
-        return topk_weights, topk_ids, is_remote
+        return topk_weights, adjusted_ids, is_remote
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, is_decode_mode: bool, residual: torch.Tensor, forward_batch: ForwardBatch, parent_task_pipe: Optional[mp.Pipe] = None, task_metadata: Optional[list] = None, cpu_result_buffer: Optional[dict] = None):
         assert self.quant_method is not None
