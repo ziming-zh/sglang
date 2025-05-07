@@ -125,10 +125,10 @@ def split_rows_kernel(
     tl.store(output_ptr + out_start + offsets, in_vals, mask=mask)
 
 def split_tensor_triton(tensor: torch.Tensor, local_idx: torch.Tensor, remote_idx: torch.Tensor):
-    if tensor.ndim == 1:
-        local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
-        remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
-        return local_tensor, remote_tensor
+    # if tensor.ndim == 1:
+    local_tensor = tensor[local_idx] if local_idx.numel() > 0 else tensor.new_empty((0,))
+    remote_tensor = tensor[remote_idx] if remote_idx.numel() > 0 else tensor.new_empty((0,))
+    return local_tensor, remote_tensor
 
     N, D = tensor.shape
     device = tensor.device
@@ -555,38 +555,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # assert remote_idx and local_idx all on gpu
             assert remote_idx.device == x.device
             assert local_idx.device == x.device
-            topk_weights_local, topk_weights_remote = split_tensor_triton(
-                topk_weights, local_idx, remote_idx
-            )
-            split_weight_end = time.time()
-            # print(f"[Layer {self.layer_id}] Split topk_weights in {split_weight_end-select_expert_end} seconds")
-            topk_ids_local, topk_ids_remote = split_tensor_triton(
-                topk_ids, local_idx, remote_idx
-            )
-            split_id_end = time.time()
-            # print(f"[Layer {self.layer_id}] Split topk_ids in {split_id_end-split_weight_end} seconds")
-            x_local, x_remote = split_tensor_triton(
-                x, local_idx, remote_idx
-            )
-            split_x_end = time.time()
-            forward_batch_local = forward_batch
-            # print(f"[Layer {self.layer_id}] Split x in {split_x_end-split_id_end} seconds")
-                
-            # print(f"[Layer {self.layer_id}] token_remote_layer: {self.token_remote_layer}")
-            if not hasattr(self, "split_stream"):
-                self.split_stream = torch.cuda.Stream()
-            with torch.cuda.stream(self.split_stream):
-                real_split_start = time.time()
-                forward_batch_local, forward_batch_remote = forward_batch.split(
-                    local_idx
+            
+            if (self.layer_id + 1) % stride_size == 0:
+                topk_weights_local, topk_weights_remote = split_tensor_triton(
+                    topk_weights, local_idx, remote_idx
                 )
-                real_split_end = time.time()
-            # print(f"[Layer {self.layer_id}] Split forward_batch in {real_split_end-real_split_start} seconds")
+                split_weight_end = time.time()
+                # print(f"[Layer {self.layer_id}] Split topk_weights in {split_weight_end-select_expert_end} seconds")
+                topk_ids_local, topk_ids_remote = split_tensor_triton(
+                    topk_ids, local_idx, remote_idx
+                )
+                split_id_end = time.time()
+                # print(f"[Layer {self.layer_id}] Split topk_ids in {split_id_end-split_weight_end} seconds")
+                x_local, x_remote = split_tensor_triton(
+                    x, local_idx, remote_idx
+                )
+                split_x_end = time.time()
+                forward_batch_local = forward_batch
+                # print(f"[Layer {self.layer_id}] Split x in {split_x_end-split_id_end} seconds")
+                    
+                # print(f"[Layer {self.layer_id}] token_remote_layer: {self.token_remote_layer}")
+                if not hasattr(self, "split_stream"):
+                    self.split_stream = torch.cuda.Stream()
+                with torch.cuda.stream(self.split_stream):
+                    real_split_start = time.time()
+                    forward_batch_local, forward_batch_remote = forward_batch.split(
+                        local_idx
+                    )
+                    real_split_end = time.time()
+                # print(f"[Layer {self.layer_id}] Split forward_batch in {real_split_end-real_split_start} seconds")
 
-            print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
+                print(f"[Layer {self.layer_id} SPLIT] x_remote: {x_remote.shape}, x_local: {x_local.shape}, cuda {x_local.device}")
             num_seqs = x.size(0)
 
-        else:
+        if (self.layer_id + 1) % stride_size != 0 or not is_decode_mode:
             x_remote = None
             x_local = x
             topk_weights_remote = None
@@ -617,7 +619,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         
             
         if residual is not None:
-            if is_decode_mode:
+            if is_decode_mode and (self.layer_id + 1) % stride_size == 0:
                 if is_remote_toks.device != x.device:
                     is_remote_toks = is_remote_toks.to(x.device)
                 residual_local, residual_remote = split_tensor_triton(
@@ -640,22 +642,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             
             
             # Buffer x_remote to avoid small CPU offloads
-            if not hasattr(forward_batch, "remote_forward_batch") or forward_batch.remote_forward_batch is None:
-                forward_batch.remote_buffer = []
-                forward_batch.remote_forward_batch_list = []
-                forward_batch.remote_forward_batch = None
+            if not hasattr(self, "remote_forward_batch"):
+                self.remote_buffer = []
+                self.remote_forward_batch_list = []
+                self.remote_forward_batch = None
 
-            if x_remote.numel() > 0:
-                # print(f"Combining {x_remote.numel()} remote tokens, cuda {x_remote.device}")
-                # self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
-                
-                forward_batch.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
             # Only offload when buffer size is 20 or more
             # Offload when buffer size reaches threshold
             if (self.layer_id + 1) % stride_size == 0: # last layer in the stride
-                if len(forward_batch.remote_buffer) >= 1:
+                
+                if x_remote.numel() > 0:
+                    # print(f"Combining {x_remote.numel()} remote tokens, cuda {x_remote.device}")
+                    # self.remote_forward_batch = self.remote_forward_batch.combine(forward_batch_remote)
+                    self.remote_forward_batch_list.append(forward_batch_remote)
+                    self.remote_buffer.append((x_remote, topk_weights_remote, topk_ids_remote, residual_remote))
+                if len(self.remote_buffer) >= 1:
                     # print(f"Offloading {len(self.remote_buffer)} remote tokens to CPU, cuda {x_remote.device}")
-                    forward_batch.remote_forward_batch_list.append(forward_batch_remote)
+                    
                     # generate a unique task ID
                     # task_id = random.randint(1, 999)
                     task_id = task_counter.get_task_id()
@@ -663,15 +666,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     # print(f"[Layer {self.layer_id}] Offloading task {task_id} to CPU at {time.time()}")
 
                     with torch.cuda.stream(self.stream_cpu):
-                        x_remote_cpu = torch.cat([item[0] for item in forward_batch.remote_buffer], dim=0).to("cpu")
-                        self.remote_forward_batch = forward_batch_remote.combine(forward_batch.remote_forward_batch_list[:-1])
+                        x_remote_cpu = torch.cat([item[0] for item in self.remote_buffer], dim=0).to("cpu")
+                        self.remote_forward_batch = forward_batch_remote.combine(self.remote_forward_batch_list[:-1])
                         # print(f"offload task {task_id} dispatched at time {time.time()}, cuda {x_remote_cpu.device}")
 
-                        topk_weights_remote_cpu = torch.cat([item[1] for item in forward_batch.remote_buffer], dim=0).to("cpu")
-                        topk_ids_remote_cpu = torch.cat([item[2] for item in forward_batch.remote_buffer], dim=0).to("cpu")
+                        topk_weights_remote_cpu = torch.cat([item[1] for item in self.remote_buffer], dim=0).to("cpu")
+                        topk_ids_remote_cpu = torch.cat([item[2] for item in self.remote_buffer], dim=0).to("cpu")
 
                         if residual_remote is not None:
-                            residual_remote_cpu = torch.cat([item[3] for item in forward_batch.remote_buffer], dim=0)
+                            residual_remote_cpu = torch.cat([item[3] for item in self.remote_buffer], dim=0)
                         else:
                             residual_remote_cpu = None
                             
@@ -698,20 +701,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             topk_ids_dtype=topk_ids_remote_cpu.dtype,
                         )
                         parent_task_pipe.send(task)
-                        # print(f"Task {task_id} sent to worker process at {time.time()}, cuda {x_remote_cpu.device}")
-
-                        # Submit task to worker process (without residual_remote_cpu and forward_batch_remote)
-                        # self.task_queue.put((task_id, self.layer_id, x_remote_cpu, topk_weights_remote_cpu, topk_ids_remote_cpu, complete_token_manager))
-
-                        # print(f"Task {task_id} sent to worker process at {time.time()}, cuda {x_remote_cpu.device}")
 
                     # Clear buffer
-                    forward_batch.remote_buffer = []
-                    forward_batch.remote_forward_batch = None
-                    forward_batch.remote_forward_batch_list = []
-                forward_batch_local.remote_buffer = forward_batch.remote_buffer
-                forward_batch_local.remote_forward_batch = forward_batch.remote_forward_batch
-                forward_batch_local.remote_forward_batch_list = forward_batch.remote_forward_batch_list
+                    self.remote_buffer = []
+                    self.remote_forward_batch_list = []
+                    self.remote_forward_batch = None
             split_end = time.time()
             # print(f"[Layer {self.layer_id}] Split remote in {split_end-split_start} seconds")
         
@@ -719,7 +713,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         fetched_cpu_results = []
         fetched_residuals = []
         fetched_forward_batch = []
-        if (self.layer_id + 2) % stride_size == 0: # last layer in the stride
+        if (self.layer_id + 1) % stride_size == 0: # last layer in the stride
             if is_decode_mode:
 
                 # retrieve results from the worker process
@@ -733,7 +727,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 self.retrieve_results()
                 # query_and_retrieve_start = time.time()
                 finished_tasks = self.complete_token_manager.query(self.round_id, self.layer_id)
-
                 # print(f"[Layer {self.layer_id} TP-RANK {get_tensor_model_parallel_rank()}] retrieved results at {time.time()}, finished tasks: {finished_tasks}", flush=True)
                 self.retrieve_results()
                 # query_and_retrieve_end = time.time()
@@ -771,7 +764,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     fetched_cpu_results.append(gpu_result)
                     fetched_residuals.append(residual_gpu)
                     fetched_forward_batch.append(forward_batch_remote)
-                    # print(f"[Combine] local input shape {x_local.shape} combined with {gpu_result.shape}")
                     del self.cpu_buffer[self.layer_id][key]
         
         torch.cuda.current_stream().wait_stream(self.stream_fused)

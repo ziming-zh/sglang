@@ -77,28 +77,33 @@ class TritonAttnBackend(AttentionBackend):
         """Update auxiliary variables for Triton attention backend."""
 
         if forward_batch.forward_mode.is_decode():
-            start_loc, _, max_seq_len, _ = self.forward_metadata
+            start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
             start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
             start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
 
             total_num_tokens = forward_batch.seq_lens_sum
+            buffer_capacity = self.attn_logits_buffer.shape[1]
             # assert total_num_tokens <= self.attn_logits_buffer.shape[1], f"total_num_tokens: {total_num_tokens}, attn_logits_buffer.shape[1]: {self.attn_logits_buffer.shape[1]}"
-            if total_num_tokens > self.attn_logits_buffer.shape[1]:
+            if total_num_tokens > buffer_capacity:
+                new_capacity = max(
+                    total_num_tokens,
+                    int(1.5 * buffer_capacity),
+                )
                 self.attn_logits_buffer = torch.empty(
-                    (self.num_head, total_num_tokens),
+                    (self.num_head, new_capacity),
                     dtype=self.reduce_dtype,
                     device=self.device,
                 )
-            assert total_num_tokens > 0, f"total_num_tokens: {total_num_tokens}"
-            attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Reuse buffer
-
+                assert total_num_tokens > 0, f"total_num_tokens: {total_num_tokens}"
+                attn_logits = self.attn_logits_buffer[:, :total_num_tokens]  # Reuse buffer
             max_seq_len = torch.max(forward_batch.seq_lens).item()
             max_extend_len = None
-        else:
-            start_loc, attn_logits, max_seq_len, _ = self.forward_metadata
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
-
-        self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
+            self.forward_metadata = (
+                start_loc,
+                attn_logits,
+                max_seq_len,
+                max_extend_len,
+            )
 
 
     def init_cuda_graph_state(self, max_bs: int):
@@ -194,6 +199,7 @@ class TritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        num_strides=8,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -204,8 +210,8 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-
-        self.update_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
+        if (layer.layer_id) % num_strides == 0:
+            self.update_forward_metadata(forward_batch) # Ziming: This initialization should supposed to be done for each forward pass, not just once.
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
 
         if save_kv_cache:

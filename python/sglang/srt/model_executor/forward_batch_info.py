@@ -193,7 +193,7 @@ class ForwardBatch:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
-    def split(self, remote_idx: torch.Tensor, local_idx: torch.Tensor) -> Tuple["ForwardBatch", "ForwardBatch"]:
+    def split(self, local_idx: torch.Tensor) -> Tuple["ForwardBatch", "ForwardBatch"]:
         """
         Splits the ForwardBatch into local and remote batches using integer indices.
 
@@ -204,20 +204,24 @@ class ForwardBatch:
         Returns:
             Tuple[ForwardBatch, ForwardBatch]: The local and remote batches.
         """
-
+        # num_local equals to number of -1 in the token_remote_layer
+        num_local = len(local_idx)
         def split_tensor(tensor: Optional[torch.Tensor]):
             if tensor is None:
                 return None, None
             return (
-                split_tensor_triton(tensor, local_idx, remote_idx)
-            )
+                tensor[:num_local],
+                tensor[num_local:]
+            )    
+            
         def split_list(lst: Optional[List]):
             if lst is None:
                 return None, None
             return (
-                [lst[i] for i in local_idx.tolist()] if local_idx.numel() > 0 else None,
-                [lst[i] for i in remote_idx.tolist()] if remote_idx.numel() > 0 else None,
+                lst[:num_local] if num_local > 0 else None,
+                lst[num_local:] if num_local < len(lst) else None,
             )
+
 
         
         local_batch = self
